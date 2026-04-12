@@ -1,0 +1,7 @@
+{
+  "name": "things",
+  "description": "Interact with the Things3 task manager via the things CLI",
+  "author": {
+    "name": "Aidan Nagorcka-Smith"
+  }
+}
