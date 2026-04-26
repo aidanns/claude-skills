@@ -65,7 +65,7 @@ If a label doesn't exist in the repo, create it once via `gh label create` (see 
 
 - **Title**: conventional commits (`type(scope): subject`). The PR title becomes the squash-merge commit subject.
 - **Body**: follows the project's PR template if present (`.github/PULL_REQUEST_TEMPLATE.md` or `.github/pull_request_template.md`). Otherwise: 1–3 bullet summary, plus a "Test plan" checklist. Always include a `Closes #<n>` footer to wire the merge to issue closure.
-- **DCO sign-off**: every commit needs `Signed-off-by:` if the project has a DCO check (`git commit -s` or `git config --local format.signoff true`).
+- **DCO sign-off**: every commit needs a `Signed-off-by:` trailer if the project has a DCO check. Use `git commit -s` for every commit. Git has no native config that makes `git commit` auto-sign-off — `format.signoff` only affects `git format-patch`, and `commit.signoff` is silently ignored. If you'd rather not type `-s` each time, alias it: `git config --local alias.c 'commit -s'`. If a commit lands without `Signed-off-by:`, fix the whole branch with `git rebase origin/main --signoff && git push --force-with-lease`.
 - **Comment reply prefix**:
   - Implementing agent: `Claude: `
   - Independent code-review subagent: `Claude Reviewer: `
