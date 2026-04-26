@@ -523,6 +523,13 @@ For each entry with `conclusion == "FAILURE"`:
 
 That merges the latest base into the PR branch and re-fires every workflow on the new HEAD SHA — picking up the current body and label state.
 
+**CodeQL stale aggregator pattern.** If `analyze (python|actions|...)` checks are all SUCCESS but the top-level `CodeQL` check is FAILURE, compare `completed_at` timestamps:
+
+- Aggregator completed *before* the analyzes → stale; it's reading old alert state. The next analyze cycle (or alert-resolution background job, ~5–10 min) will clear it. Don't dispatch an agent to investigate.
+- Aggregator completed *after* the analyzes → real alert. Investigate.
+
+The `gh api repos/.../code-scanning/alerts` endpoint requires `security_events` scope on the token; if you get 403, fall back to the Security tab in the GitHub UI or have the user dismiss the alert directly. If you hit this pattern often, consider running `gh auth refresh -s security_events` once at the orchestrator level so subsequent investigations can read the alert state via `gh api` directly.
+
 If the failure is environmental (infra outage, rate limit, unrelated to your diff): report it in the PR body and skip — do not retry blindly.
 
 #### 6.4 Set automerge — TERMINAL STEP
@@ -781,6 +788,12 @@ The `Monitor` tool surfaces each stdout line of `monitor-pr.sh` as a notificatio
 | `CONFLICT <pr#> <branch> <base> <files>` | Dispatch the **conflict-resolution mini-agent** (template below). |
 | `CI_FAILURE <pr#> <check> <run-id>` | Size the fix first (see **CI-failure sizing rule** below). If ≤50 lines / 1-2 files, fix in-place at the orchestrator level. Otherwise dispatch the **CI-failure-fix mini-agent** (template below). |
 | `NEW_COMMENT <pr#> <comment-id>` | Dispatch the **review-comment mini-agent** (template below). |
+
+#### CI-failure stale-aggregator short-circuit
+
+Before dispatching the CI-failure-fix mini-agent, check the stale-aggregator pattern (see 6.3). If the failing check is `CodeQL` and the `analyze (...)` sub-jobs are SUCCESS, compare `completed_at` timestamps. Aggregator before analyzes = stale, will self-clear in ~5–10 min on the next analyze cycle or alert-resolution background job — don't dispatch. Let the shell monitor keep polling; the next `gh pr view` tick will observe the cleared rollup. Aggregator after analyzes = real alert, fall through to the sizing rule below.
+
+The `gh api repos/.../code-scanning/alerts` endpoint requires `security_events` scope on the orchestrator's token; a 403 here means fall back to the Security tab in the GitHub UI (or `gh auth refresh -s security_events` if this pattern recurs).
 
 #### CI-failure sizing rule
 
