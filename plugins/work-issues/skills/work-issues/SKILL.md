@@ -608,7 +608,7 @@ while :; do
   # ---- DIRTY / CONFLICTING: escalate to conflict-resolution mini-agent. ----
   if [[ "$mergeable" == "CONFLICTING" || "$msstatus" == "DIRTY" ]]; then
     files=$(gh pr view "$pr" --json files --jq '[.files[].path] | join(",")' 2>/dev/null || echo "")
-    emit "CONFLICT $pr $branch $files"
+    emit "CONFLICT $pr $branch $base $files"
     # Sleep longer after escalating — give the mini-agent time to push a fix
     # before we re-detect the same conflict.
     sleep $((poll * 4)); continue
@@ -660,7 +660,7 @@ The `Monitor` tool surfaces each stdout line of `monitor-pr.sh` as a notificatio
 | `MERGED <pr-url>` | Mark issue task `completed`. Stop the monitor. Trigger Phase 6 housekeeping. |
 | `CLOSED <pr-url>` | Surface to user — PR was closed without merging. Stop the monitor. |
 | `BEHIND_RESOLVED <pr#>` | Log only. Refresh the next progress digest. |
-| `CONFLICT <pr#> <branch> <files>` | Dispatch the **conflict-resolution mini-agent** (template below). |
+| `CONFLICT <pr#> <branch> <base> <files>` | Dispatch the **conflict-resolution mini-agent** (template below). |
 | `CI_FAILURE <pr#> <check> <run-id>` | Dispatch the **CI-failure-fix mini-agent** (template below). |
 | `NEW_COMMENT <pr#> <comment-id>` | Dispatch the **review-comment mini-agent** (template below). |
 
@@ -675,7 +675,7 @@ These are intentionally tighter than the main dispatch template — no full pipe
 #### Conflict-resolution mini-agent
 
 ```
-You are resolving a merge conflict on PR #<pr#> in <repo>. Branch: `<branch>`. Conflicting files (best estimate): <files>.
+You are resolving a merge conflict on PR #<pr#> in <repo>. Branch: `<branch>`. Base: `<base>`. Conflicting files (best estimate): <files>.
 
 You run in an isolated worktree (`isolation: worktree`). Your first command is, verbatim:
 
