@@ -795,6 +795,30 @@ Mini-agents run in their own isolated worktrees with `run_in_background: true`. 
 
 When a dispatched mini-agent returns `RESOLVED` / `FIXED` / `ADDRESSED`, the shell monitor — still polling — will eventually observe the underlying state has cleared (conflict gone, CI green, comment threaded) and stop emitting that event. If a mini-agent returns `BLOCKED <question>` or `ENVIRONMENTAL <reason>`, the orchestrator surfaces it to the user and may stop the monitor (treat the PR as parked, just like a `BLOCKED` from the implementing agent).
 
+### Tiered remediation when AUTOMERGE_SET stalls
+
+When a PR sits in `AUTOMERGE_SET` longer than ~5 minutes after CI rollup is fully green and the shell monitor's `green + waiting` no-op state has persisted, the merge bot has likely failed to fire (or fired and exited cleanly waiting for a re-trigger that never came). Work through these tiers **in order — don't loop on the early ones**. If a tier fails twice, escalate to the next; don't retry the same tier indefinitely.
+
+1. **Tier 1 — `mergeStateStatus == "BEHIND"`.** Already automated by the Phase 5b shell monitor's in-shell auto-resolve (`git fetch origin <base> && git merge --no-edit origin/<base> && git push`); usually clears in ~30s on the next monitor tick. The orchestrator only steps in here if the shell monitor crashed — in which case relaunch the monitor first, and only fall back to running the same `git fetch / merge / push` by hand if the monitor still won't run. **Do not** reintroduce the `update-branch` API call; the local-merge approach is the contract.
+
+2. **Tier 2 — CI rollup truly green but the merge bot didn't fire.** Toggle the project's merge-trigger label (typically `automerge` — read the merge workflow's `on:` block to confirm the label name): remove the label, sleep ~3 seconds, re-add. This fires a fresh `pull_request: labeled` event the bot listens to. **Don't loop on tier 2 more than twice.** If two toggles haven't worked, the bot is probably losing a race against another `labeled`-triggered workflow — jump to tier 3.
+
+3. **Tier 3 — toggle keeps losing a race.** When another workflow on the same repo also triggers on `pull_request: labeled` (e.g. a changelog bot, a notifier), every label toggle starts a new race that the merge bot can lose. Look for a project-specific **`workflow_dispatch` break-glass** on the merge workflow itself — most merge-bot patterns expose a manual dispatch input that takes a PR number and bypasses the `labeled` event entirely:
+
+   ```bash
+   gh workflow run <merge-workflow>.yml -f pr_number=<N>
+   ```
+
+   Read the merge workflow's `on:` block to see what `workflow_dispatch` inputs are available (typical input names: `pr_number`, `pr`, `pull_request_number`). This is the standard escape hatch from label-toggle races — don't keep re-toggling the label hoping the race resolves itself.
+
+4. **Tier 4 — bot consistently exits "waiting for pending checks" but rollup looks green.** The bot may be reading a stale check entry from a prior commit. Probe the merge bot's own run log to see *which* check it considers pending:
+
+   ```bash
+   gh run view <merge-bot-run> --log
+   ```
+
+   If the bot is keying off a check name that no longer matches the current head SHA's checks (a common dedupe-aware-evaluation gap), the fix is project-specific — surface the finding to the user rather than guessing.
+
 ### Mini-agent dispatch templates
 
 These are intentionally tighter than the main dispatch template — no full pipeline scaffolding, no plan step, no review subagent. Each is a focused prompt for a single narrow job. Project conventions are still consulted (the agent reads `CLAUDE.md` if it has to commit), but the prompt does not re-embed them in full.
