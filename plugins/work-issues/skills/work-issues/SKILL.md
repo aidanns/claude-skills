@@ -30,7 +30,7 @@ Selectors compose: `/work-issues --milestone "MS-2 General" --label scheduled` i
 - **Public-break = blocker, internal = self-resolve.** Anything that would change a publicly-observable surface (API shape, file path, schema, naming convention, semver bump) is a blocker requiring user clarification. Internal implementation choices the agent makes itself with a one-line justification in the PR body.
 - **Strict isolation.** Every dispatched agent runs with `isolation: worktree`. No file-state collisions.
 - **Best-effort context sharing.** When B declares a dependency on A and A has merged, B's dispatch prompt includes A's PR summary and any new types/helpers A introduced. Independent issues start cold.
-- **Concurrency cap: 3.** Three agents in flight at once. "In flight" = actively implementing or addressing review. An agent that has set automerge and returned `MERGED-PENDING` does not count toward the cap — the orchestrator monitors the merge from there.
+- **Concurrency cap: 3.** Three agents in flight at once. "In flight" = actively implementing or addressing review. An agent that has set automerge and returned `AUTOMERGE_SET` does not count toward the cap — the orchestrator's shell monitor (Phase 5b) drives the PR to merge from there, escalating to focused mini-agents only when judgment is required.
 
 ## Universal work conventions
 
@@ -189,7 +189,7 @@ Track task lifecycle in lockstep with the issue label lifecycle:
 
 - On dispatch (Phase 5 step 3): `TaskUpdate(status: "in_progress")`.
 - On `MERGED` notification (Phase 5 step 4): `TaskUpdate(status: "completed")`.
-- On `MERGED-PENDING`: leave the task `in_progress`; flip to `completed` when the orchestrator's monitor confirms the merge.
+- On `AUTOMERGE_SET`: leave the task `in_progress`; flip to `completed` when the Phase 5b shell monitor emits `MERGED`.
 - On `BLOCKED` / `PAUSED`: leave `in_progress`; the task surfaces the parked state to the user.
 
 For dependencies declared in Phase 3, set `addBlockedBy` on the dependent task so the task list reflects the dispatch order.
@@ -229,7 +229,7 @@ Loop until every issue is terminal (merged, parked, or excluded):
 
 4. **Monitor** — Claude Code notifies the orchestrator when each background agent completes. On notification:
    - **MERGED**: GitHub closed the issue via `Closes #<n>`. Mark task done; pick up the next eligible issue.
-   - **MERGED-PENDING**: agent set automerge and exited. Slot is now free — pick up the next eligible issue. The orchestrator schedules a wakeup (`ScheduleWakeup` ~270s) to poll PR state until merged. On `BEHIND`: `git fetch origin main && git merge --no-edit origin/main && git push` from a fresh checkout of the PR branch (automerge does not auto-update behind branches). On new CI failures: investigate (don't bypass) and either fix locally or re-dispatch a small fix-up agent.
+   - **AUTOMERGE_SET**: agent set automerge and exited. Slot is now free — pick up the next eligible issue. The orchestrator hands off to **Phase 5b** (post-automerge monitoring): a thin shell monitor polls the PR; auto-resolves `BEHIND` in-shell; emits events that the orchestrator routes to focused mini-agents for `CONFLICT` / `CI_FAILURE` / `NEW_COMMENT`; exits on `MERGED`.
    - **BLOCKED**: ensure `blocked` label set, `in-progress` removed; record the question for batched surfacing in Phase 7.
    - **PAUSED**: ensure `paused` (or `blocked`) label is set; record the reset time. Re-dispatch a resumption agent (Phase 5 step 0 path) after the condition clears.
    - **ERRORED**: surface immediately to user; do not retry without instruction.
@@ -244,8 +244,9 @@ The TaskCreate list (Phase 4) is the durable surface. Augment it with a chat-vis
 
 **Cadence:**
 
-- On every orchestrator wakeup tick (~270s) while at least one issue is in-flight (`in-progress` or `merge_pending`). Schedule a recurring `ScheduleWakeup(delaySeconds: 270)` whenever the in-flight count > 0 and no wakeup is already pending.
-- Immediately on every dispatched-agent terminal return (`MERGED`, `MERGED-PENDING`, `BLOCKED`, `PAUSED`, `ERRORED`) — emit a digest of the remaining in-flight set so the user sees the new state without waiting for the next tick.
+- On every orchestrator wakeup tick (~270s) while at least one issue is in-flight (`in-progress` or `automerge_set`). Schedule a recurring `ScheduleWakeup(delaySeconds: 270)` whenever the in-flight count > 0 and no wakeup is already pending.
+- Immediately on every dispatched-agent terminal return (`MERGED`, `AUTOMERGE_SET`, `BLOCKED`, `PAUSED`, `ERRORED`) — emit a digest of the remaining in-flight set so the user sees the new state without waiting for the next tick.
+- Immediately on every Phase 5b monitor event (`MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, mini-agent `RESOLVED` / `FIXED` / `ADDRESSED`) — same digest line so the user sees what the shell monitor and its mini-agents are doing.
 
 **Per-issue probe** — for each in-flight issue `<N>`:
 
@@ -278,10 +279,10 @@ The TaskCreate list (Phase 4) is the durable surface. Augment it with a chat-vis
    - Any `status == "IN_PROGRESS"` or `"QUEUED"` → `CI: pending (<done>/<total>)`.
    - Rollup empty → `CI: not started`.
 
-4. **Merge state** — `mergeable` + `mergeStateStatus` from the same `gh pr list` query (the dispatch pipeline already has remediation logic for the non-clean cases in step 10 — this signal just surfaces them to the user):
+4. **Merge state** — `mergeable` + `mergeStateStatus` from the same `gh pr list` query (Phase 5b's shell monitor handles remediation for the non-clean cases — this signal just surfaces them to the user):
 
-   - `mergeable == "CONFLICTING"` or `mergeStateStatus == "DIRTY"` → `merge: conflict`. The dispatched agent (or its post-merge monitor) will resolve via the merge-conflict path in step 10; surfacing it here means the user notices before then if a conflict has sat unresolved across ticks.
-   - `mergeStateStatus == "BEHIND"` → `merge: behind`. Resolved by merging main into the PR branch (see step 10); usually transient.
+   - `mergeable == "CONFLICTING"` or `mergeStateStatus == "DIRTY"` → `merge: conflict`. The Phase 5b shell monitor will emit a `CONFLICT` event and the orchestrator will dispatch the conflict-resolution mini-agent; surfacing it here means the user notices if a conflict sits unresolved across ticks.
+   - `mergeStateStatus == "BEHIND"` → `merge: behind`. Auto-resolved in-shell by Phase 5b's monitor (`git fetch origin main && git merge --no-edit origin/main && git push`); usually transient.
    - `mergeable == "MERGEABLE"` (any non-conflicting `mergeStateStatus`) → `merge: clean`.
    - `mergeable == "UNKNOWN"` → `merge: computing`. GitHub hasn't finished computing mergeability yet; will resolve on the next tick.
 
@@ -366,7 +367,7 @@ Conventional commit messages with `Signed-off-by:` if the project has DCO. Commi
 
 ### 6. Review and merge loop
 
-Steps 6.1 through 6.5 form a single phase: spawn the review subagent, address whatever it finds, address any CI failures, set automerge, then drive the PR to merge. **The review subagent's findings are not your final output** — they are the *start* of the merge loop. The only valid terminal returns from this phase are `MERGED`, `MERGED-PENDING`, `BLOCKED`, `PAUSED`, or `ERRORED` (see Output section).
+Steps 6.1 through 6.4 form a single phase: spawn the review subagent, address whatever it finds, address any CI failures, then set automerge. **The review subagent's findings are not your final output** — they are the *start* of the merge loop. The only valid terminal returns from this phase are `AUTOMERGE_SET`, `MERGED`, `BLOCKED`, `PAUSED`, or `ERRORED` (see Output section). Setting automerge in 6.4 is your terminal step — the orchestrator's Phase 5b shell monitor drives the PR the rest of the way to merge.
 
 #### 6.1 Spawn review subagent
 
@@ -412,6 +413,8 @@ Issue-level comments don't have thread replies — reply with a new issue commen
 
 If the only review output is a single `Claude Reviewer: LGTM` issue-level comment, there are no findings to address — proceed to 6.3.
 
+**Note on conflict resolution.** A merge conflict that surfaces *before* you set automerge is yours to resolve in this loop. After you set automerge in 6.4, conflict resolution is delegated to the orchestrator's Phase 5b shell monitor, which dispatches a focused conflict-resolution mini-agent.
+
 #### 6.3 Address CI failures
 
 Fetch PR status:
@@ -433,45 +436,20 @@ That merges the latest base into the PR branch and re-fires every workflow on th
 
 If the failure is environmental (infra outage, rate limit, unrelated to your diff): report it in the PR body and skip — do not retry blindly.
 
-#### 6.4 Set automerge
+#### 6.4 Set automerge — TERMINAL STEP
 
 Once review comments are addressed AND CI is green (or known-environmental):
 
   gh pr merge <pr#> --auto --squash
 
-The merge happens automatically once all required checks pass.
+This is your last action. The merge happens asynchronously once all required checks pass. **Return immediately** with one of:
 
-**Default: hand off to the orchestrator now.** Return `MERGED-PENDING <pr-url>` and exit. The orchestrator monitors the merge from here (handles `BEHIND`, conflict resolution, and final merge confirmation). This frees your slot for the next issue ~10 minutes sooner per PR.
+- `AUTOMERGE_SET <pr-url>` — automerge configured, no findings outstanding, CI green or in flight. The orchestrator's Phase 5b shell monitor takes over from here (handles `BEHIND`, conflicts, CI failures, new review comments via focused mini-agents).
+- `MERGED <pr-url>` — the PR merged synchronously between you setting automerge and exiting (rare but possible — `gh pr merge --auto` may immediately complete the merge if all required checks were already green).
 
-Only continue to 6.5 if the orchestrator's dispatch prompt explicitly told you to "stay alive through merge."
+If the repo does not have automerge enabled and `gh pr merge --auto --squash` errors out, fall back to `gh pr merge <pr#> --squash` (immediate squash-merge) and return `MERGED <pr-url>`.
 
-#### 6.5 Monitor until merged (only if asked)
-
-If asked to stay through merge, loop every ~5 minutes:
-
-  sleep 270
-  gh pr view <pr#> --json state,mergeable,mergeStateStatus,statusCheckRollup
-
-**Stay silent in the loop.** Do NOT emit text or schedule a new turn between polls — only output your structured return ONCE, when `state == "MERGED"`. Narrating progress between polls breaks the structured-output contract; the orchestrator interprets any non-structured text as a premature exit.
-
-Until merged:
-
-- **`mergeStateStatus == "BEHIND"`** (no conflict, just out-of-date with main): `gh pr merge --auto --squash` does not auto-update branches when behind — automerge stays parked indefinitely until the branch catches up.
-
-      git fetch origin main && git merge --no-edit origin/main && git push
-
-  Don't wait for it to block automerge — main may move again.
-
-- **Merge conflict** (`mergeStateStatus == "DIRTY"` or `mergeable == "CONFLICTING"`):
-  - `git fetch origin <base>`.
-  - `git merge origin/<base>` (prefer merge over rebase on review branches — preserves review history).
-  - Resolve conflicts minimally; keep the intent of both sides unless one clearly supersedes.
-  - Run the project's check task (`task check`, `scripts/lint.sh`, `npm test`, etc.) to confirm.
-  - Commit the merge, push.
-
-- **CI failure after automerge**: investigate per 6.3, push fix.
-
-When `state == "MERGED"`: return `MERGED <pr-url>`. The worktree is automatically cleaned up by `isolation: worktree`.
+**Do not poll for merge state. Do not narrate progress.** The whole point of returning here is to free your slot — narrating between polls is what Phase 5b is designed to eliminate.
 
 #### Worked example: review came back clean
 
@@ -488,13 +466,13 @@ gh pr view <pr#> --json statusCheckRollup \
   --jq '[.statusCheckRollup[] | select(.conclusion=="FAILURE")] | length'
 # expected: 0 (or only known-environmental — see 6.3 for handling)
 
-# 6.4 — set automerge and hand off.
+# 6.4 — set automerge and exit.
 gh pr merge <pr#> --auto --squash
 ```
 
-Then return `MERGED-PENDING <pr-url>` as the structured output. Do not summarise the review back to the orchestrator; the LGTM comment is on the PR for the orchestrator's digest to pick up directly.
+Then return `AUTOMERGE_SET <pr-url>` as the structured output (or `MERGED <pr-url>` if the PR merged synchronously). Do not summarise the review back to the orchestrator; the LGTM comment is on the PR for the orchestrator's digest to pick up directly.
 
-**You have only completed your task when you return `MERGED`, `BLOCKED`, or `ERRORED`. Returning the review subagent's findings is not a valid output. If the review is clean (only `Claude Reviewer: LGTM`), immediately set automerge and proceed to the monitor sub-step. Do not summarise the review back to the orchestrator.**
+**You have only completed your task when you return `AUTOMERGE_SET`, `MERGED`, `BLOCKED`, `PAUSED`, or `ERRORED`. Returning the review subagent's findings is not a valid output. If the review is clean (only `Claude Reviewer: LGTM`), immediately set automerge and exit. Do not summarise the review back to the orchestrator. Do not poll for merge state — the orchestrator's Phase 5b shell monitor owns that.**
 
 ## Blocker handling
 
@@ -528,15 +506,254 @@ The orchestrator can re-dispatch with a resumption prompt (Phase 5 step 0) once 
 
 ## Output
 
-Return EXACTLY ONE of these strings, ONCE, at the very end. Do not narrate progress between polls — any non-structured text is interpreted by the orchestrator as a premature exit.
+Return EXACTLY ONE of these strings, ONCE, at the very end. Do not narrate progress — any non-structured text is interpreted by the orchestrator as a premature exit.
 
-- `MERGED <pr-url>` — PR has actually merged.
-- `MERGED-PENDING <pr-url>` — automerge is set, no findings outstanding, CI green or in flight. Orchestrator monitors the merge from here.
+- `AUTOMERGE_SET <pr-url>` — automerge is set, no findings outstanding, CI green or in flight. The orchestrator's Phase 5b shell monitor takes over and drives the PR to merge. **This is the default success exit.**
+- `MERGED <pr-url>` — PR has actually merged. Possible when automerge isn't enabled (you fell back to `gh pr merge --squash`) or when the PR merged synchronously between you setting automerge and exiting.
 - `BLOCKED <N> <question>` — parked on a public-break ambiguity awaiting clarification.
 - `PAUSED <N> <reason>` — environmentally paused (usage cap, infra outage). Orchestrator may re-dispatch when the condition clears.
 - `ERRORED <N> <error>` — non-recoverable failure.
 
-If you find yourself thinking "the review is done, I should report back" — don't. The review is the *start* of the merge loop, not the end.
+If you find yourself thinking "the review is done, I should report back" — don't. The review is the *start* of the merge loop, not the end. If you find yourself thinking "I should poll until the PR merges" — don't. Setting automerge is the end of your job; Phase 5b owns the rest.
+```
+
+## Phase 5b — Post-automerge monitoring
+
+Once an implementing agent returns `AUTOMERGE_SET <pr-url>`, the orchestrator owns the PR until merge. The goal is to spend as few tokens as possible on the wait-for-CI / wait-for-automerge tail without giving up the ability to recover from `BEHIND`, conflicts, CI failures, or new review comments.
+
+### Trade-off rationale (why a shell monitor + mini-agents, not a warm agent)
+
+The previous design kept the implementing agent warm through the entire wait-for-merge tail — burning hundreds of thousands of tokens per PR on polling that an LLM adds no value to. The current design swaps that warm agent for a thin shell monitor for the trivial cases (`BEHIND` auto-merge, `MERGED` detection, `green + waiting` no-op), escalating to a focused mini-agent only when the monitor sees something requiring judgment (`CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`).
+
+Each escalation pays a cold-start cost (~30–50k tokens loading project conventions). A PR with 3 escalations during its life pays 3× that. The always-warm-agent approach paid that cost once but spent ~400k tokens monitoring. The crossover is around 6–8 escalations per PR, which essentially never happens for normal PRs. So the thin-monitor approach wins for the realistic distribution (most PRs: 0–2 escalations); the always-warm approach is only better for pathological PRs.
+
+The other resilience win: a crashed monitor doesn't lose pipeline state — it just stops polling, and the orchestrator can relaunch it. A crashed always-warm agent loses the entire PR's monitoring state and may not resume cleanly. **If the workload distribution shifts (e.g. a project where most PRs hit 5+ conflicts) re-evaluate this split — the crossover point is the relevant signal.**
+
+### Handoff
+
+When step 4 of the Phase 5 execution loop receives `AUTOMERGE_SET <pr-url>` from a dispatched agent:
+
+1. Mark the issue as `automerge_set` in internal state (the slot is free; `in-flight` count drops).
+2. Launch the **shell monitor** (below) for that PR via the `Monitor` tool. The monitor's stdout is an event stream the orchestrator consumes.
+3. Continue the Phase 5 execution loop — pick up the next eligible issue.
+
+### Shell monitor recipe
+
+The monitor is a single bash script. Stdout lines are events; the orchestrator routes each event line to the appropriate handler. Stderr is for the script's own diagnostics (logged but not interpreted as events).
+
+Save as `monitor-pr.sh` (or paste inline into the `Monitor` tool's command — both work). Invocation: `monitor-pr.sh <pr#> <pr-branch> <repo-base-branch>` (e.g. `monitor-pr.sh 451 aidanns/foo-fix main`).
+
+```bash
+#!/usr/bin/env bash
+#
+# Phase 5b shell monitor: drive a PR to merge, escalating to mini-agents on judgment cases.
+#
+set -uo pipefail  # NOT -e: a single failed gh call shouldn't kill the loop.
+
+pr="${1:?pr number required}"
+branch="${2:?pr branch required}"
+base="${3:-main}"
+poll="${POLL_INTERVAL:-45}"  # seconds between polls.
+
+emit() { printf '%s\n' "$*"; }  # one event per line, line-buffered by default.
+
+# Track which CI failures and review comments we've already escalated, so we
+# don't re-emit on every tick.
+seen_failures=""   # space-separated run IDs.
+seen_comments=""   # space-separated comment IDs.
+
+while :; do
+  state_json=$(gh pr view "$pr" --json state,url,mergeable,mergeStateStatus,statusCheckRollup,headRefOid 2>/dev/null || true)
+  if [[ -z "$state_json" ]]; then
+    # Transient network blip — sleep and retry without crashing.
+    sleep "$poll"; continue
+  fi
+
+  state=$(jq -r '.state' <<<"$state_json")
+  url=$(jq -r '.url' <<<"$state_json")
+  mergeable=$(jq -r '.mergeable' <<<"$state_json")
+  msstatus=$(jq -r '.mergeStateStatus' <<<"$state_json")
+
+  # ---- Terminal: PR merged. Emit and exit. ----
+  if [[ "$state" == "MERGED" ]]; then
+    emit "MERGED $url"
+    exit 0
+  fi
+  if [[ "$state" == "CLOSED" ]]; then
+    emit "CLOSED $url"  # PR was closed without merging — orchestrator decides.
+    exit 0
+  fi
+
+  # ---- BEHIND + MERGEABLE: auto-resolve in-shell (no LLM). ----
+  # Automerge does NOT auto-update behind branches. We catch it up locally.
+  if [[ "$msstatus" == "BEHIND" && "$mergeable" != "CONFLICTING" ]]; then
+    (
+      tmpdir=$(mktemp -d)
+      cd "$tmpdir"
+      gh repo clone "$(gh repo view --json nameWithOwner -q .nameWithOwner)" repo -- --branch "$branch" --depth 50 >/dev/null 2>&1 || exit 0
+      cd repo
+      git fetch origin "$base" >/dev/null 2>&1 || exit 0
+      if git merge --no-edit "origin/$base" >/dev/null 2>&1; then
+        git push origin "$branch" >/dev/null 2>&1 || true
+        emit "BEHIND_RESOLVED $pr"
+      else
+        # The merge produced conflicts — escalate via the CONFLICT path below
+        # on the next tick (don't double-emit here).
+        git merge --abort >/dev/null 2>&1 || true
+      fi
+      rm -rf "$tmpdir"
+    )
+  fi
+
+  # ---- DIRTY / CONFLICTING: escalate to conflict-resolution mini-agent. ----
+  if [[ "$mergeable" == "CONFLICTING" || "$msstatus" == "DIRTY" ]]; then
+    files=$(gh pr view "$pr" --json files --jq '[.files[].path] | join(",")' 2>/dev/null || echo "")
+    emit "CONFLICT $pr $branch $files"
+    # Sleep longer after escalating — give the mini-agent time to push a fix
+    # before we re-detect the same conflict.
+    sleep $((poll * 4)); continue
+  fi
+
+  # ---- CI failure: escalate per failing check (deduplicated by run ID). ----
+  while read -r failure; do
+    [[ -z "$failure" ]] && continue
+    run_id=$(jq -r '.databaseId' <<<"$failure")
+    name=$(jq -r '.name' <<<"$failure")
+    if [[ -n "$run_id" && "$run_id" != "null" && " $seen_failures " != *" $run_id "* ]]; then
+      emit "CI_FAILURE $pr $name $run_id"
+      seen_failures="$seen_failures $run_id"
+    fi
+  done < <(jq -c '.statusCheckRollup[]? | select(.conclusion == "FAILURE")' <<<"$state_json")
+
+  # ---- New top-level review comment from a non-bot reviewer: escalate. ----
+  while read -r comment; do
+    [[ -z "$comment" ]] && continue
+    cid=$(jq -r '.id' <<<"$comment")
+    if [[ -n "$cid" && "$cid" != "null" && " $seen_comments " != *" $cid "* ]]; then
+      emit "NEW_COMMENT $pr $cid"
+      seen_comments="$seen_comments $cid"
+    fi
+  done < <(
+    gh api "repos/{owner}/{repo}/pulls/$pr/comments" --paginate 2>/dev/null \
+      | jq -c '.[]? | select(.in_reply_to_id == null)
+                    | select((.user.type // "User") != "Bot")
+                    | select((.body // "") | startswith("Claude") | not)'
+  )
+
+  sleep "$poll"
+done
+```
+
+Key behaviours:
+
+- **`BEHIND` auto-resolution stays in-shell.** Uses the same local-merge approach the implementing agent uses (`git fetch origin main && git merge --no-edit origin/main && git push`) — no `update-branch` API call, consistent with the rest of this skill.
+- **Transient `gh` failures** (network blips, rate-limit retries) don't crash the loop — `|| true` and an empty-result check keep polling.
+- **Deduplication** — failing run IDs and review comment IDs are tracked, so a persistent failure escalates exactly once per ID, not on every tick.
+- **`Claude` -prefixed comments are skipped** so the monitor doesn't re-escalate on the implementing agent's or reviewer subagent's own comments.
+
+### Orchestrator event routing
+
+The `Monitor` tool surfaces each stdout line of `monitor-pr.sh` as a notification. The orchestrator routes events as follows:
+
+| Event line | Orchestrator action |
+|---|---|
+| `MERGED <pr-url>` | Mark issue task `completed`. Stop the monitor. Trigger Phase 6 housekeeping. |
+| `CLOSED <pr-url>` | Surface to user — PR was closed without merging. Stop the monitor. |
+| `BEHIND_RESOLVED <pr#>` | Log only. Refresh the next progress digest. |
+| `CONFLICT <pr#> <branch> <files>` | Dispatch the **conflict-resolution mini-agent** (template below). |
+| `CI_FAILURE <pr#> <check> <run-id>` | Dispatch the **CI-failure-fix mini-agent** (template below). |
+| `NEW_COMMENT <pr#> <comment-id>` | Dispatch the **review-comment mini-agent** (template below). |
+
+Mini-agents run in their own isolated worktrees with `run_in_background: true`. They do **not** count against the implementing-agent concurrency cap of 3 — they're focused, short-lived, and are part of a PR that has already cleared the implementing-agent slot. (Cap them informally if you observe contention; defer formal limits until needed.)
+
+When a dispatched mini-agent returns `RESOLVED` / `FIXED` / `ADDRESSED`, the shell monitor — still polling — will eventually observe the underlying state has cleared (conflict gone, CI green, comment threaded) and stop emitting that event. If a mini-agent returns `BLOCKED <question>` or `ENVIRONMENTAL <reason>`, the orchestrator surfaces it to the user and may stop the monitor (treat the PR as parked, just like a `BLOCKED` from the implementing agent).
+
+### Mini-agent dispatch templates
+
+These are intentionally tighter than the main dispatch template — no full pipeline scaffolding, no plan step, no review subagent. Each is a focused prompt for a single narrow job. Project conventions are still consulted (the agent reads `CLAUDE.md` if it has to commit), but the prompt does not re-embed them in full.
+
+#### Conflict-resolution mini-agent
+
+```
+You are resolving a merge conflict on PR #<pr#> in <repo>. Branch: `<branch>`. Conflicting files (best estimate): <files>.
+
+You run in an isolated worktree (`isolation: worktree`). Your first command is, verbatim:
+
+  git fetch origin && git checkout <branch> && git pull && git merge origin/<base>
+
+This WILL produce conflict markers — that is expected. Do not try to "fix" anything before reproducing the conflict locally. If the merge unexpectedly succeeds (someone else resolved it), push and return `RESOLVED`.
+
+Resolve the conflicts minimally:
+
+- Keep the intent of both sides where possible.
+- Prefer the side that clearly supersedes if one is newer / more correct.
+- Read `CLAUDE.md` only if the conflict is in code where project conventions matter (e.g. naming, file layout). Skip otherwise.
+- Run the project's check task (`task check`, `scripts/lint.sh`, `npm test`, etc.) if there's an obvious one — skip if not.
+- Commit the merge with a conventional-commits message: `chore(merge): resolve conflicts with <base>`.
+- Push.
+
+Return EXACTLY ONE of:
+- `RESOLVED <pr-url>` — merge committed and pushed.
+- `BLOCKED <question>` — the conflict requires a public-break decision (e.g. two competing API shapes). Comment on the PR with `Claude: Blocked — <question>` first.
+- `ERRORED <reason>` — non-recoverable.
+```
+
+#### CI-failure-fix mini-agent
+
+```
+You are fixing a CI failure on PR #<pr#> in <repo>. Failing check: `<check>`. Run ID: <run-id>. Branch: `<branch>`.
+
+You run in an isolated worktree (`isolation: worktree`). Check out the PR branch:
+
+  gh pr checkout <pr#>
+
+<if the orchestrator's Phase 1 auto-memory sweep returned hits:
+Known-broken CI / manual workarounds in this project (swept from `~/.claude/projects/<slug>/memory/`):
+- <verbatim body of each matched memory entry, separated by `---`>
+If the failing check matches one of these, follow the documented workaround instead of trying to fix the underlying check.>
+
+Pipeline:
+
+1. Read the failure logs: `gh run view <run-id> --log-failed`.
+2. Diagnose the root cause. Do NOT bypass the check, disable it, or retry blindly.
+3. **A check passing 'success' isn't the same as the check doing its job.** If the failing check depends on an upstream artifact (e.g. `changelog-lint` failing because no `pr-<N>-*.yml` exists), look at the upstream workflow's logs for `secrets not configured`-style notices before concluding it's a real failure.
+4. Fix the root cause. Commit with a conventional-commits message referencing the failing check (e.g. `fix(ci): correct lint config for <check>`).
+5. `git pull --rebase origin <branch>` then `git push`.
+
+Return EXACTLY ONE of:
+- `FIXED <pr-url>` — fix pushed.
+- `BLOCKED <question>` — fixing requires a public-break decision. Comment on the PR with `Claude: Blocked — <question>` first.
+- `ENVIRONMENTAL <reason>` — failure is infra / rate-limit / unrelated to the diff. Comment on the PR with `Claude: <reason>` and exit; do NOT retry.
+- `ERRORED <reason>` — non-recoverable.
+```
+
+#### Review-comment mini-agent
+
+```
+You are addressing a review comment on PR #<pr#> in <repo>. Comment ID: <comment-id>.
+
+You run in an isolated worktree (`isolation: worktree`). Check out the PR branch:
+
+  gh pr checkout <pr#>
+
+Pipeline:
+
+1. Read the comment:
+
+     gh api 'repos/{owner}/{repo}/pulls/comments/<comment-id>'
+
+2. Make the requested change, OR document why the suggestion shouldn't be adopted.
+3. Commit with a conventional-commits message describing the change.
+4. `git pull --rebase origin <branch>` then `git push`.
+5. Reply to the comment thread:
+
+     gh api --method POST 'repos/{owner}/{repo}/pulls/<pr#>/comments/<comment-id>/replies' \
+       -f body='Claude: Done!'  (or `Claude: <one-line explanation of the alternative approach>`)
+
+Return EXACTLY ONE of:
+- `ADDRESSED <pr-url>` — change pushed and reply posted.
+- `BLOCKED <question>` — the suggestion requires a public-break decision. Comment on the PR with `Claude: Blocked — <question>` first.
+- `ERRORED <reason>` — non-recoverable.
 ```
 
 ## Phase 6 — Post-completion housekeeping
@@ -594,13 +811,15 @@ For runs that may span context windows, persist minimal state at `.claude/work-i
 {
   "in_scope": [280, 281, 282, 283, 284],
   "merged": [280],
-  "merge_pending": {"281": "https://github.com/o/r/pull/91"},
+  "automerge_set": {"281": "https://github.com/o/r/pull/91"},
   "in_progress": [282],
   "blocked": {"283": "needs schema decision"},
   "paused": {"284": "usage cap until 2026-04-25T10:10Z"},
   "deps": {"281": [280], "282": [280]}
 }
 ```
+
+The `automerge_set` map tracks PRs handed off to Phase 5b's shell monitor; entries clear when the monitor emits `MERGED`.
 
 Read on start (if present, resume); write on every label change. Delete on Phase 8 completion.
 
