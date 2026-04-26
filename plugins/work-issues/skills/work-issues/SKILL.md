@@ -796,7 +796,13 @@ Return EXACTLY ONE of:
 
 When the orchestrator detects a merged PR (via Phase 5 monitoring):
 
-- Confirm the issue closed (`gh issue view <n> --json state` should report `CLOSED`).
+- Confirm the issue closed (`gh issue view <n> --json state` should report `CLOSED`). **If still OPEN, close manually:**
+
+  ```bash
+  gh issue close <n> --comment "Closed by merge of PR #<P> (squash commit <sha>). Auto-close didn't fire — closing manually."
+  ```
+
+  GitHub's auto-close-on-`Closes #N` is unreliable for App-token-mediated API merges (observed in repos using a merge-bot pattern with bypass-actor App tokens). Don't wait for it; verify and close yourself.
 - The `in-progress` label persists on the closed issue (intentional — preserves audit trail).
 - Update internal state; pick up the next eligible issue.
 
