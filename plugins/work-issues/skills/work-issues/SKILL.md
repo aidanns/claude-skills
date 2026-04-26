@@ -49,7 +49,7 @@ These rules are embedded in every dispatched agent's prompt so the skill works f
 
 - Each dispatched agent runs in an isolated worktree (`isolation: worktree` on the Agent call). The worktree is created fresh from the latest `main`.
 - Within the worktree: `git fetch origin main && git reset --hard origin/main` before the first edit (defensive — `isolation: worktree` already does this, but the agent confirms).
-- Branch name: `<author>/<short-slug>` if the project's recently-merged PRs show a different convention; otherwise default to `<username>/<short-slug>` where `<username>` is the GitHub login of the authenticated user (`gh api user --jq .login`). The slug is a 2-4 word description of the change.
+- Branch name: default to `<username>/<short-slug>` where `<username>` is the GitHub login of the authenticated user (`gh api user --jq .login`) and `<short-slug>` is a 2-4 word description. Projects that care about a different convention can encode it in `CLAUDE.md`.
 - After merge, the worktree is cleaned up automatically by Claude Code.
 
 ### Issue label lifecycle
@@ -210,10 +210,12 @@ Loop until every issue is terminal (merged, parked, or excluded):
 
 4. **Monitor** — Claude Code notifies the orchestrator when each background agent completes. On notification:
    - **MERGED**: GitHub closed the issue via `Closes #<n>`. Mark task done; pick up the next eligible issue.
-   - **MERGED-PENDING**: agent set automerge and exited. Slot is now free — pick up the next eligible issue. The orchestrator schedules a wakeup (`ScheduleWakeup` ~270s) to poll PR state until merged. On `BEHIND`: `gh api --method PUT 'repos/.../pulls/<pr#>/update-branch'`. On new CI failures: investigate (don't bypass) and either fix locally or re-dispatch a small fix-up agent.
+   - **MERGED-PENDING**: agent set automerge and exited. Slot is now free — pick up the next eligible issue. The orchestrator schedules a wakeup (`ScheduleWakeup` ~270s) to poll PR state until merged. On `BEHIND`: `git fetch origin main && git merge --no-edit origin/main && git push` from a fresh checkout of the PR branch (automerge does not auto-update behind branches). On new CI failures: investigate (don't bypass) and either fix locally or re-dispatch a small fix-up agent.
    - **BLOCKED**: ensure `blocked` label set, `in-progress` removed; record the question for batched surfacing in Phase 7.
    - **PAUSED**: ensure `paused` (or `blocked`) label is set; record the reset time. Re-dispatch a resumption agent (Phase 5 step 0 path) after the condition clears.
    - **ERRORED**: surface immediately to user; do not retry without instruction.
+
+   The harness occasionally fires duplicate `task-notification` events for an agent after it has already terminated — recognisable by 0 tool uses and a generic-sounding result string. Ignore these; rely on your own Monitor task or PR-state polling for ground truth.
 
 5. **Continue** until all terminal.
 
@@ -260,7 +262,7 @@ The TaskCreate list (Phase 4) is the durable surface. Augment it with a chat-vis
 4. **Merge state** — `mergeable` + `mergeStateStatus` from the same `gh pr list` query (the dispatch pipeline already has remediation logic for the non-clean cases in step 10 — this signal just surfaces them to the user):
 
    - `mergeable == "CONFLICTING"` or `mergeStateStatus == "DIRTY"` → `merge: conflict`. The dispatched agent (or its post-merge monitor) will resolve via the merge-conflict path in step 10; surfacing it here means the user notices before then if a conflict has sat unresolved across ticks.
-   - `mergeStateStatus == "BEHIND"` → `merge: behind`. Auto-resolvable via `update-branch`; usually transient.
+   - `mergeStateStatus == "BEHIND"` → `merge: behind`. Resolved by merging main into the PR branch (see step 10); usually transient.
    - `mergeable == "MERGEABLE"` (any non-conflicting `mergeStateStatus`) → `merge: clean`.
    - `mergeable == "UNKNOWN"` → `merge: computing`. GitHub hasn't finished computing mergeability yet; will resolve on the next tick.
 
@@ -307,7 +309,7 @@ You run in an isolated worktree (Claude Code's `isolation: worktree` already cre
   git fetch origin main && git reset --hard origin/main
   git checkout -b <branch-name>
 
-Branch naming: detect the project's convention from recent merged PRs (`gh pr list --state merged --limit 10 --json headRefName --jq '.[].headRefName'`) and follow it if there's a clear pattern. Otherwise default to `<username>/<short-slug>`, where `<username>` is the authenticated user (`gh api user --jq .login`) and `<short-slug>` is a 2-4 word description of the change.
+Default branch name: `<username>/<short-slug>` where `<username>` is `gh api user --jq .login` and `<short-slug>` is a 2-4 word description. Projects that care about a different convention can encode it in `CLAUDE.md`.
 
 ### 1. Plan (if non-trivial)
 
@@ -424,11 +426,11 @@ If asked to stay through merge, loop every ~5 minutes:
 
 Until merged:
 
-- **`mergeStateStatus == "BEHIND"`**: GitHub auto-merge waits when the branch is behind base. Re-fire CI on a fresh merge commit:
+- **`mergeStateStatus == "BEHIND"`** (no conflict, just out-of-date with main): `gh pr merge --auto --squash` does not auto-update branches when behind — automerge stays parked indefinitely until the branch catches up.
 
-      gh api --method PUT 'repos/{owner}/{repo}/pulls/<pr#>/update-branch'
+      git fetch origin main && git merge --no-edit origin/main && git push
 
-  Same one-shot remedy used in step 8 — merges base in via the API and re-fires every workflow on the new SHA.
+  Don't wait for it to block automerge — main may move again.
 
 - **Merge conflict** (`mergeStateStatus == "DIRTY"` or `mergeable == "CONFLICTING"`):
   - `git fetch origin <base>`.
