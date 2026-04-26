@@ -130,8 +130,32 @@ Look for patterns the dispatched agent needs to match that may not be in `CLAUDE
 - **Body format** — does the body wrap the commit message in a delimited block (e.g. `==COMMIT_MSG==`)? Where do `Closes #N` and `Signed-off-by:` sit (inside the block, or outside)?
 - **Labels at merge time** — is there a `no changelog` / `automerge` / similar label that's consistently applied? Does the project use a merge-bot that requires a specific label?
 - **Manual changelog entry** — do recently-merged PRs touch `changelog/@unreleased/pr-<N>-<slug>.yml` or similar? If so, the dispatched agent must hand-author one (or apply a `no changelog` label for non-user-visible changes).
+- **Merge mechanism** — does the project rely on a label-triggered merge-bot, or on GitHub's native auto-merge? See the detection heuristic below; this finding is surfaced as a `Merge mechanism:` line so sub-step 6.4 can act on it without hardcoding a command.
 
-Compile observations into a "Current PR conventions (observed)" block and inject it into every dispatched agent's prompt — this beats relying on `CLAUDE.md` being current.
+### Detecting the merge mechanism
+
+Some projects flip `allow_squash_merge=false` and route merges through a merge-bot triggered by a label (e.g. `automerge`); on those projects, `gh pr merge --auto --squash` is at best a no-op and at worst skips the bot's commit-message extraction. To classify the project's mechanism from recent merged PRs:
+
+1. **Workflow probe.** Does the repo have a workflow whose `on:` block listens to a `pull_request: types: [labeled]` event with a label-name filter? Common paths: `.github/workflows/merge-bot.yml`, `.github/workflows/automerge*.yml`. If yes, capture the label name from the workflow's `if:` guard.
+
+   ```bash
+   gh api 'repos/{owner}/{repo}/contents/.github/workflows' \
+     --jq '.[].name' 2>/dev/null
+   # then read each candidate workflow's `on:` and `if:` blocks
+   ```
+
+2. **PR-label cross-check.** Does the captured label appear consistently on the most recent merged PRs?
+
+   ```bash
+   gh pr list --state merged --limit 5 --json number,labels \
+     --jq '.[] | {n: .number, labels: [.labels[].name]}'
+   ```
+
+   If the label appears on essentially every merged PR, the project uses the merge-bot. If the label is absent or sporadic, default to native auto-merge.
+
+If both signals agree on a label-triggered bot, record the finding as `Merge mechanism: apply <label> label (merge-bot picks it up)`. Otherwise default to `Merge mechanism: gh pr merge --auto --squash` (native auto-merge).
+
+Compile observations into a "Current PR conventions (observed)" block — including the `Merge mechanism:` line — and inject it into every dispatched agent's prompt. This beats relying on `CLAUDE.md` being current, and sub-step 6.4 of the dispatch template reads the `Merge mechanism:` line to decide what to do.
 
 ## Phase 2 — Pre-flight clarification
 
@@ -318,6 +342,7 @@ Project context: this repo's conventions are described in `CLAUDE.md` (root), `.
 
 Current PR conventions (observed from the most recent merged PRs — `CLAUDE.md` may not yet reflect these):
 <orchestrator's Phase 1.5 observations: title prefix style, body-block format like ==COMMIT_MSG==, label requirements like `no changelog` / `automerge`, manual changelog YAML entries, etc.>
+Merge mechanism: <one of `apply <label> label (merge-bot picks it up)` or `gh pr merge --auto --squash` — sub-step 6.4 below reads this line, do not hardcode a merge command>
 
 <if any deps merged: Dependency context — these issues already merged and may have introduced helpers / types / files you should reuse:
 - #<dep>: <PR title>. Summary: <one-line summary of what merged>.>
@@ -438,16 +463,22 @@ If the failure is environmental (infra outage, rate limit, unrelated to your dif
 
 #### 6.4 Set automerge — TERMINAL STEP
 
-Once review comments are addressed AND CI is green (or known-environmental):
+Once review comments are addressed AND CI is green (or known-environmental), hand off to merge by reading the `Merge mechanism:` line from the "Current PR conventions (observed)" block above:
 
-  gh pr merge <pr#> --auto --squash
+- If `Merge mechanism: apply <label> label (merge-bot picks it up)` — apply the label and let the project's merge-bot drive the merge:
 
-This is your last action. The merge happens asynchronously once all required checks pass. **Return immediately** with one of:
+      gh pr edit <pr#> --add-label <observed-label>
 
-- `AUTOMERGE_SET <pr-url>` — automerge configured, no findings outstanding, CI green or in flight. The orchestrator's Phase 5b shell monitor takes over from here (handles `BEHIND`, conflicts, CI failures, new review comments via focused mini-agents).
-- `MERGED <pr-url>` — the PR merged synchronously between you setting automerge and exiting (rare but possible — `gh pr merge --auto` may immediately complete the merge if all required checks were already green).
+- If `Merge mechanism: gh pr merge --auto --squash` (or the line is absent / unrecognised — default to native auto-merge):
 
-If the repo does not have automerge enabled and `gh pr merge --auto --squash` errors out, fall back to `gh pr merge <pr#> --squash` (immediate squash-merge) and return `MERGED <pr-url>`.
+      gh pr merge <pr#> --auto --squash
+
+This is your last action. The merge happens asynchronously once all required checks pass (and, for the merge-bot path, once the bot picks up the label). **Return immediately** with one of:
+
+- `AUTOMERGE_SET <pr-url>` — merge handoff complete (label applied or `--auto` set), no findings outstanding, CI green or in flight. The orchestrator's Phase 5b shell monitor takes over from here (handles `BEHIND`, conflicts, CI failures, new review comments via focused mini-agents).
+- `MERGED <pr-url>` — the PR merged synchronously between you handing off and exiting (rare but possible — `gh pr merge --auto` may immediately complete the merge if all required checks were already green; merge-bot paths typically don't merge synchronously).
+
+If the native-auto-merge branch errors out (the repo doesn't have automerge enabled), fall back to `gh pr merge <pr#> --squash` (immediate squash-merge) and return `MERGED <pr-url>`. The label-triggered path has no equivalent fallback — if applying the label errors out, surface the error rather than guessing.
 
 **Do not poll for merge state. Do not narrate progress.** The whole point of returning here is to free your slot — narrating between polls is what Phase 5b is designed to eliminate.
 
@@ -466,7 +497,10 @@ gh pr view <pr#> --json statusCheckRollup \
   --jq '[.statusCheckRollup[] | select(.conclusion=="FAILURE")] | length'
 # expected: 0 (or only known-environmental — see 6.3 for handling)
 
-# 6.4 — set automerge and exit.
+# 6.4 — hand off to merge per the `Merge mechanism:` line in the observed-PR-conventions block.
+# If the line says `apply automerge label (merge-bot picks it up)`:
+gh pr edit <pr#> --add-label automerge
+# Otherwise (native auto-merge — the default):
 gh pr merge <pr#> --auto --squash
 ```
 
@@ -508,8 +542,8 @@ The orchestrator can re-dispatch with a resumption prompt (Phase 5 step 0) once 
 
 Return EXACTLY ONE of these strings, ONCE, at the very end. Do not narrate progress — any non-structured text is interpreted by the orchestrator as a premature exit.
 
-- `AUTOMERGE_SET <pr-url>` — automerge is set, no findings outstanding, CI green or in flight. The orchestrator's Phase 5b shell monitor takes over and drives the PR to merge. **This is the default success exit.**
-- `MERGED <pr-url>` — PR has actually merged. Possible when automerge isn't enabled (you fell back to `gh pr merge --squash`) or when the PR merged synchronously between you setting automerge and exiting.
+- `AUTOMERGE_SET <pr-url>` — merge handoff complete (label applied or native automerge set per the `Merge mechanism:` observation), no findings outstanding, CI green or in flight. The orchestrator's Phase 5b shell monitor takes over and drives the PR to merge. **This is the default success exit.**
+- `MERGED <pr-url>` — PR has actually merged. Possible when automerge isn't enabled and you fell back to `gh pr merge --squash`, or when the PR merged synchronously between you handing off and exiting.
 - `BLOCKED <N> <question>` — parked on a public-break ambiguity awaiting clarification.
 - `PAUSED <N> <reason>` — environmentally paused (usage cap, infra outage). Orchestrator may re-dispatch when the condition clears.
 - `ERRORED <N> <error>` — non-recoverable failure.
@@ -835,7 +869,7 @@ This skill is gh-specific. To extend to another tracker (Linear, Jira, etc.) the
 | Add/remove labels | `gh issue edit <n> --add-label / --remove-label` |
 | Comment | `gh issue comment <n>` |
 | Native sub-issue / dep primitive | `gh api repos/.../issues/<n>/sub_issues` |
-| Set automerge | `gh pr merge <n> --auto --squash` |
+| Hand off to merge | `gh pr merge <n> --auto --squash` (native) or `gh pr edit <n> --add-label <bot-label>` (label-triggered merge-bot — see Phase 1.5 detection) |
 | Check CI | `gh pr checks <n>` / `gh pr view --json statusCheckRollup` |
 | List PR review comments | `gh api repos/.../pulls/<n>/comments` |
 | Reply to review comment | `gh api --method POST repos/.../pulls/<n>/comments/<id>/replies` |
