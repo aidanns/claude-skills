@@ -199,6 +199,8 @@ Native sub-issue links via `POST /repos/:owner/:repo/issues/<n>/sub_issues` are 
 
 Build a directed acyclic graph; topologically order. Cycles are a hard error — surface to user, abort.
 
+When dependencies are declared (e.g. `Depends on #N`), encode them via `addBlockedBy` on the corresponding TaskCreate task (Phase 4) so the harness's native dep tracking surfaces blocked / unblocked transitions in the task list rather than relying on a manually-maintained graph.
+
 ## Phase 4 — Scheduling
 
 Apply `scheduled` to every in-scope issue and create one orchestrator task per issue via `TaskCreate` so progress is visible in the main session's task list:
@@ -218,7 +220,7 @@ Track task lifecycle in lockstep with the issue label lifecycle:
 - On dispatch (Phase 5 step 3): `TaskUpdate(status: "in_progress")`.
 - On `MERGED` notification (Phase 5 step 4): `TaskUpdate(status: "completed")`.
 - On `AUTOMERGE_SET`: leave the task `in_progress`; flip to `completed` when the Phase 5b shell monitor emits `MERGED`.
-- On `BLOCKED` / `PAUSED`: leave `in_progress`; the task surfaces the parked state to the user.
+- On `BLOCKED` / `PAUSED`: leave `in_progress`; update the task `description` with the parked question / pause reason so the task list surfaces *why* it is parked, not just that it is.
 
 For dependencies declared in Phase 3, set `addBlockedBy` on the dependent task so the task list reflects the dispatch order.
 
@@ -885,6 +887,8 @@ When the loop drains (no more eligible issues, in-flight count = 0):
 3. After answers: update affected issue bodies via `gh issue edit <n> --body`, remove `blocked` labels, restart agents on those issues. Re-enter Phase 5.
 
 ## Phase 8 — Completion
+
+The orchestrator's `TaskList` is the canonical state surface — every in-scope issue has a tracking task that flips through `pending` → `in_progress` → `completed` (or stays `in_progress` on `BLOCKED` / `PAUSED`). The chat-visible final report below is a one-shot snapshot at run end, not the source of truth; refer back to `TaskList` for live state.
 
 Final report to user:
 
