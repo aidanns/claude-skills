@@ -624,6 +624,14 @@ Return EXACTLY ONE of these strings, ONCE, at the very end. Do not narrate progr
 - `PAUSED <N> <reason>` — environmentally paused (usage cap, infra outage). Orchestrator may re-dispatch when the condition clears.
 - `ERRORED <N> <error>` — non-recoverable failure.
 
+### Returning your terminal status
+
+The orchestrator parses **only** the `result` field of your final notification, and it parses by literal prefix match. Format discipline is load-bearing:
+
+- The `result` field of your final notification MUST start with one of the literal terminal tokens above (`AUTOMERGE_SET`, `MERGED`, `BLOCKED`, `PAUSED`, `ERRORED`) followed by the relevant args. No leading prose, no quoting, no markdown — the token is the first thing the orchestrator sees.
+- Heartbeat notifications during 6.1 → 6.4 (e.g. "ran review subagent", "addressed CI failure", "applied automerge label") are fine and encouraged — they let the user see progress. Only the *final* notification is the terminal handoff; only its `result` is parsed.
+- If you find yourself wanting to narrate ("the PR merged successfully, returning MERGED ..."), that's a heartbeat at best. The terminal contract is the literal token plus its args, nothing else. Freeform prose around the token breaks the orchestrator's parse and forces a manual recovery.
+
 If you find yourself thinking "the review is done, I should report back" — don't. The review is the *start* of the merge loop, not the end. If you find yourself thinking "I should poll until the PR merges" — don't. Setting automerge is the end of your job; Phase 5b owns the rest.
 ```
 
