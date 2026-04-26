@@ -1,9 +1,9 @@
 ---
-name: work-issues
-description: Process one or more GitHub issues end-to-end through implementation and merge. Triggered by /work-issues with optional args (issue numbers, --label, --milestone, --parent). Self-contained orchestration — embeds the full work pipeline (worktree, plan, PR, self-review, code-review subagent, CI babysitting, automerge) so it works without project-specific CLAUDE.md scaffolding. Defaults: 3 concurrent agents, park-and-continue on blockers, sequential dependency-aware execution.
+name: implement
+description: Process one or more GitHub issues end-to-end through implementation and merge. Triggered by /workflow:implement with optional args (issue numbers, --label, --milestone, --parent). Self-contained orchestration — embeds the full work pipeline (worktree, plan, PR, self-review, code-review subagent, CI babysitting, automerge) so it works without project-specific CLAUDE.md scaffolding. Defaults: 3 concurrent agents, park-and-continue on blockers, sequential dependency-aware execution.
 ---
 
-# work-issues
+# implement
 
 Take one or more GitHub issues from intake to merge in a self-managing loop. Invoke when stepping away while several issues land.
 
@@ -11,17 +11,17 @@ The skill is self-contained: every dispatched agent receives the full work pipel
 
 ## Invocation
 
-`/work-issues [<args>]`
+`/workflow:implement [<args>]`
 
 | Form | Behaviour |
 |---|---|
-| `/work-issues 280 281 282` | Process the listed issues. |
-| `/work-issues --label <name>` | Process all open issues carrying the label. |
-| `/work-issues --milestone "<title>"` | Process all open issues in the milestone. |
-| `/work-issues --parent <n>` | Process all sub-issues of the parent issue. |
-| `/work-issues` | Default: equivalent to `--label scheduled`. |
+| `/workflow:implement 280 281 282` | Process the listed issues. |
+| `/workflow:implement --label <name>` | Process all open issues carrying the label. |
+| `/workflow:implement --milestone "<title>"` | Process all open issues in the milestone. |
+| `/workflow:implement --parent <n>` | Process all sub-issues of the parent issue. |
+| `/workflow:implement` | Default: equivalent to `--label scheduled`. |
 
-Selectors compose: `/work-issues --milestone "MS-2 General" --label scheduled` intersects them.
+Selectors compose: `/workflow:implement --milestone "MS-2 General" --label scheduled` intersects them.
 
 ## Operating principles
 
@@ -967,7 +967,7 @@ When the orchestrator observes a `MERGED` event — either from an implementing 
 When an agent reports `BLOCKED`:
 
 - Verify the `blocked` label is set on the issue and the issue has a `Claude: Blocked` comment.
-- Record the question in a parked-questions list (in-memory; optionally write to `.claude/work-issues-state.json` for resumability).
+- Record the question in a parked-questions list (in-memory; optionally write to `.claude/workflow-implement-state.json` for resumability).
 - Continue with other ready issues.
 
 When the loop drains (no more eligible issues, in-flight count = 0):
@@ -985,7 +985,7 @@ Final report to user:
 - N issues processed: X merged, Y parked, Z excluded.
 - Links to merged PRs.
 - Outstanding parked questions (if any) — `blocked` label remains, awaiting attention.
-- Suggested next step: `/work-issues --label blocked` to resume parked issues after answering.
+- Suggested next step: `/workflow:implement --label blocked` to resume parked issues after answering.
 
 ## Bail-outs (stop the entire run)
 
@@ -1005,7 +1005,7 @@ In each case: leave labels as-is, surface immediately to user, do not proceed.
 
 ## State persistence
 
-For runs that may span context windows, persist minimal state at `.claude/work-issues-state.json` in the project root:
+For runs that may span context windows, persist minimal state at `.claude/workflow-implement-state.json` in the project root:
 
 ```json
 {

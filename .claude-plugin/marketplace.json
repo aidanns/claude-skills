@@ -14,9 +14,9 @@
       "source": "./plugins/things"
     },
     {
-      "name": "work-issues",
-      "description": "Process one or more GitHub issues end-to-end through implementation and merge",
-      "source": "./plugins/work-issues"
+      "name": "workflow",
+      "description": "Workflow-automation skills (end-to-end GitHub issue execution; sibling skills planned)",
+      "source": "./plugins/workflow"
     }
   ]
 }

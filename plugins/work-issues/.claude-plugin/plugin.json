@@ -1,7 +1,0 @@
-{
-  "name": "work-issues",
-  "description": "Process one or more GitHub issues end-to-end through implementation and merge — worktree, plan, PR, self-review, code-review subagent, CI babysitting, automerge.",
-  "author": {
-    "name": "Aidan Nagorcka-Smith"
-  }
-}
