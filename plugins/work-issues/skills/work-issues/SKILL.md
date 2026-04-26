@@ -255,7 +255,7 @@ Loop until every issue is terminal (merged, parked, or excluded):
 
 4. **Monitor** — Claude Code notifies the orchestrator when each background agent completes. On notification:
    - **MERGED**: GitHub closed the issue via `Closes #<n>`. Mark task done; pick up the next eligible issue.
-   - **AUTOMERGE_SET**: agent set automerge and exited. Slot is now free — pick up the next eligible issue. The orchestrator hands off to **Phase 5b** (post-automerge monitoring): a thin shell monitor polls the PR; auto-resolves `BEHIND` in-shell; emits events that the orchestrator routes to focused mini-agents for `CONFLICT` / `CI_FAILURE` / `NEW_COMMENT`; exits on `MERGED`.
+   - **AUTOMERGE_SET**: agent set automerge and exited. Slot is now free — pick up the next eligible issue. The orchestrator hands off to **Phase 5b** (post-automerge monitoring): a thin shell monitor polls the PR; auto-resolves `BEHIND` in-shell; emits events that the orchestrator routes to focused mini-agents for `CONFLICT` / `CI_FAILURE` / `NEW_COMMENT`; exits on `MERGED`. **Review-fallback check:** if the PR body contains a `### Self-review only` section (the implementing agent's harness lacked the `Task` / `general-purpose` subagent type), dispatch a separate review subagent at the orchestrator level *before* the merge lands. Use the same review prompt the dispatch template's 6.1 would have used and treat its output as a normal review pass — any findings flow back to the PR via inline `Claude Reviewer: ` comments and the Phase 5b monitor's `NEW_COMMENT` event will route them to the review-comment mini-agent.
    - **BLOCKED**: ensure `blocked` label set, `in-progress` removed; record the question for batched surfacing in Phase 7.
    - **PAUSED**: ensure `paused` (or `blocked`) label is set; record the reset time. Re-dispatch a resumption agent (Phase 5 step 0 path) after the condition clears.
    - **ERRORED**: surface immediately to user; do not retry without instruction.
@@ -411,6 +411,8 @@ Spawn ONE Agent (subagent_type: general-purpose, run_in_background: false) to re
   >     -f line=<line>
   >
   > Use the `Claude Reviewer: ` prefix on every comment. If the diff is clean (no findings), post a single PR comment via `gh pr comment <pr#> --body 'Claude Reviewer: LGTM. <one-line summary of what you checked>'` and return.
+
+**Fallback if the `Task` / `general-purpose` subagent type is unavailable in your harness.** Do NOT skip review. Self-review the diff against the same checklist the subagent would use (scope creep, undocumented decisions, missing tests, dead code, unclear naming, breaking changes that aren't called out, security issues, convention violations) and add a `### Self-review only` section to the PR body explicitly stating the subagent was unavailable and listing what you checked. Then proceed to 6.2 normally and return `AUTOMERGE_SET` as normal — the orchestrator's Phase 5 monitoring greps for `### Self-review only` and dispatches a review subagent at its own level to fill the gap.
 
 Wait for it to complete. **When it returns, do NOT report its findings back to the orchestrator — proceed immediately to 6.2.**
 
