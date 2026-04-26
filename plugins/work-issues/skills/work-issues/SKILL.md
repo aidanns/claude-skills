@@ -55,7 +55,7 @@ These rules are embedded in every dispatched agent's prompt so the skill works f
 ### Issue label lifecycle
 
 - **`scheduled`**: applied at intake (Phase 4) for every in-scope issue.
-- **`in-progress`**: applied when an agent picks up the issue (Phase 5, immediately after worktree creation, before drafting the plan). `scheduled` is removed at the same time.
+- **`in-progress`**: applied when an agent picks up the issue (Phase 5, immediately after worktree creation). Persists through PR creation, review, automerge-set, and merge confirmation. Only swapped out on `BLOCKED` (→ `blocked`) or `PAUSED` (→ `paused`). On merge, the label remains on the closed issue as the audit trail.
 - **`blocked`**: applied when an agent parks the issue awaiting clarification (Phase 7). `in-progress` is removed.
 - **Issue closure**: when the PR merges with a `Closes #<n>` footer, GitHub closes the issue automatically and the `in-progress` label persists on the closed issue (intentional — preserves the audit trail of who picked it up).
 
@@ -470,6 +470,8 @@ That merges the latest base into the PR branch and re-fires every workflow on th
 If the failure is environmental (infra outage, rate limit, unrelated to your diff): report it in the PR body and skip — do not retry blindly.
 
 #### 6.4 Set automerge — TERMINAL STEP
+
+**Do NOT remove the `in-progress` label when applying `automerge`.** The label persists from worktree-creation through merge — that's the audit trail of who handled the issue. The label only comes off on `BLOCKED` (replaced by `blocked`) or `PAUSED` (replaced by `paused`); otherwise the orchestrator (or GitHub's auto-close) handles cleanup after merge confirmation.
 
 Once review comments are addressed AND CI is green (or known-environmental), hand off to merge by reading the `Merge mechanism:` line from the "Current PR conventions (observed)" block above:
 
