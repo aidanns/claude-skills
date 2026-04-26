@@ -255,6 +255,46 @@ Loop until every issue is terminal (merged, parked, or excluded):
    gh issue edit <n> --add-label in-progress --remove-label scheduled
    ```
 
+2a. **Pre-dispatch stale-path scan** — applies *only* to issues whose declared deps merged after Phase 1 intake (i.e. mid-run). Skip otherwise.
+
+   When a dep PR rearranges code (renames a package, collapses one module into another), file paths quoted in the dependent issue's body — `packages/foo/src/foo/bar.py:78–91`, `src/auth/login.ts`, etc. — go stale. The dispatched agent reads the issue body verbatim, so a stale path either burns tokens hunting for files that no longer exist or, worse, leads the agent to recreate the moved structures rather than editing the new ones.
+
+   Scan the issue body before building the dispatch prompt:
+
+   1. Extract candidate paths via `grep -oE`. Cover three shapes: `packages/...`, `src/...`, and bare repo-root files (e.g. `Cargo.toml`, `pyproject.toml`). Line-number suffixes `:NN` or `:NN-NN` (or em-dash `:NN–NN`) are common in this repo and must be stripped before the existence check.
+   2. For each candidate, check existence in the *post-merge* tree with `git ls-tree HEAD <path>` (or `test -e <path>` if a worktree is already checked out at the repo root).
+   3. If any path is stale, **prefer injecting a `Stale paths (deps merged mid-run)` preamble into the dispatch prompt** over editing the public issue body. The preamble keeps the issue body unchanged (no public-state churn) while still naming each missing path for the dispatched agent. The preamble is rendered just below the `Dependency context` block — see the dispatch template's `<if any deps merged: ...>` placeholder.
+   4. Fallback option: if the orchestrator wants the architecture refresh visible to humans browsing the issue (e.g. the dep PR's restructure is non-obvious and future readers benefit), append a one-line `Architecture refresh (after #<dep> merged): <old-path> moved to <new-path>` note via `gh issue edit <n> --body "<existing>\n\n<note>"`. This mutates public state, so reach for the preamble first.
+
+   Worked example — issue #332 quotes `packages/gpg-backend-cli-host/src/gpg_backend_cli_host/gpg.py:78–91` and dep #316 collapsed that package into `gpg-bridge`:
+
+   ```bash
+   body=$(gh issue view <n> --json body --jq .body)
+
+   # 1. Extract candidate paths. Strip optional :NN[-NN] / :NN–NN suffix in a second pass.
+   paths=$(printf '%s\n' "$body" \
+     | grep -oE '(packages/[A-Za-z0-9_./-]+|src/[A-Za-z0-9_./-]+|\b[A-Za-z0-9_-]+\.(toml|yaml|yml|json|md|lock))(:[0-9]+(-[0-9]+|–[0-9]+)?)?' \
+     | sed -E 's/:[0-9]+(-[0-9]+|–[0-9]+)?$//' \
+     | sort -u)
+
+   # 2. Existence check against post-merge HEAD. Collect stale paths.
+   stale=()
+   while IFS= read -r p; do
+     [[ -z "$p" ]] && continue
+     if ! git ls-tree -r HEAD --name-only | grep -qxF "$p"; then
+       stale+=("$p")
+     fi
+   done <<<"$paths"
+
+   # 3. If stale paths found, render the preamble for the dispatch prompt.
+   if (( ${#stale[@]} > 0 )); then
+     printf 'Stale paths (deps merged mid-run): the following paths in the issue body no longer exist in HEAD — locate the new home before editing:\n'
+     printf -- '- %s\n' "${stale[@]}"
+   fi
+   ```
+
+   Inject the preamble's stdout into the dispatch prompt (see the dispatch template below). If the array is empty, omit the section — exactly the same convention the Phase 1 auto-memory sweep uses.
+
 3. **Dispatch agent** with `isolation: worktree`, `run_in_background: true`. Use the **dispatch prompt template** below.
 
 4. **Monitor** — Claude Code notifies the orchestrator when each background agent completes. On notification:
@@ -352,6 +392,12 @@ Merge mechanism: <one of `apply <label> label (merge-bot picks it up)` or `gh pr
 
 <if any deps merged: Dependency context — these issues already merged and may have introduced helpers / types / files you should reuse:
 - #<dep>: <PR title>. Summary: <one-line summary of what merged>.>
+
+<if the Phase 5 step 2a stale-path scan found stale paths in the issue body (only when deps merged mid-run):
+Stale paths (deps merged mid-run): the following paths quoted in the issue body above no longer exist in HEAD — locate the new home before editing instead of recreating the moved structures:
+- <path 1>
+- <path 2>
+The dep PR(s) listed under Dependency context above rearranged the relevant code; check those PR diffs for the new layout.>
 
 <if the Phase 1 auto-memory sweep returned hits:
 Known-broken CI / manual workarounds in this project (swept from `~/.claude/projects/<slug>/memory/` — assume current unless the entry is dated stale):
