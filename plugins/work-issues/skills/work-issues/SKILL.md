@@ -50,7 +50,7 @@ These rules are embedded in every dispatched agent's prompt so the skill works f
 - Each dispatched agent runs in an isolated worktree (`isolation: worktree` on the Agent call). The worktree is created fresh from the latest `main`.
 - Within the worktree: `git fetch origin main && git reset --hard origin/main` before the first edit (defensive — `isolation: worktree` already does this, but the agent confirms).
 - Branch name: default to `<username>/<short-slug>` where `<username>` is the GitHub login of the authenticated user (`gh api user --jq .login`) and `<short-slug>` is a 2-4 word description. Projects that care about a different convention can encode it in `CLAUDE.md`.
-- After merge, the worktree is cleaned up automatically by Claude Code.
+- After merge, the orchestrator removes the worktree in Phase 6 (see `/close-worktree`). The auto-clean behavior of `isolation: worktree` only fires when the agent made no changes — which is never the case for a successful run — so explicit cleanup is required.
 
 ### Issue label lifecycle
 
@@ -848,17 +848,19 @@ Return EXACTLY ONE of:
 
 ## Phase 6 — Post-completion housekeeping
 
-When the orchestrator detects a merged PR (via Phase 5 monitoring):
+When the orchestrator observes a `MERGED` event — either from an implementing agent's terminal `MERGED <pr-url>` return (synchronous merge case) or from the Phase 5b shell monitor's `MERGED <pr-url>` event (the `AUTOMERGE_SET → MERGED` handoff):
 
-- Confirm the issue closed (`gh issue view <n> --json state` should report `CLOSED`). **If still OPEN, close manually:**
+1. **Confirm the issue closed** (`gh issue view <n> --json state` should report `CLOSED`). **If still OPEN, close manually:**
 
-  ```bash
-  gh issue close <n> --comment "Closed by merge of PR #<P> (squash commit <sha>). Auto-close didn't fire — closing manually."
-  ```
+   ```bash
+   gh issue close <n> --comment "Closed by merge of PR #<P> (squash commit <sha>). Auto-close didn't fire — closing manually."
+   ```
 
-  GitHub's auto-close-on-`Closes #N` is unreliable for App-token-mediated API merges (observed in repos using a merge-bot pattern with bypass-actor App tokens). Don't wait for it; verify and close yourself.
-- The `in-progress` label persists on the closed issue (intentional — preserves audit trail).
-- Update internal state; pick up the next eligible issue.
+   GitHub's auto-close-on-`Closes #N` is unreliable for App-token-mediated API merges (observed in repos using a merge-bot pattern with bypass-actor App tokens). Don't wait for it; verify and close yourself.
+
+2. **Remove the worktree** at the path returned in the agent's notification. The existing `/close-worktree` skill encapsulates this — `cd` out of the worktree, `git worktree remove --force <path>`, then `git worktree prune`. Reuse that skill rather than re-deriving the steps. This step is required: `isolation: worktree` only auto-cleans when the agent made no changes, and a successful run always makes changes — so without explicit removal, every merged PR leaves a locked worktree under `.claude/worktrees/agent-<id>/` that grows disk and inode cost monotonically.
+
+3. **Update task state.** The `in-progress` label persists on the closed issue (intentional — preserves audit trail). Flip the in-flight `TaskCreate` task to `completed` and pick up the next eligible issue.
 
 ## Phase 7 — Block handling
 
