@@ -27,7 +27,7 @@ Selectors compose: `/work-issues --milestone "MS-2 General" --label scheduled` i
 
 - **Sequential phases.** Don't skip; if a phase yields no work, log and continue.
 - **Park, don't block.** A blocker on issue A never stops independent issues B and C.
-- **Public-break = blocker, internal = self-resolve.** Anything that would change a publicly-observable surface (API shape, file path, schema, naming convention, semver bump) is a blocker requiring user clarification. Internal implementation choices the agent makes itself with a one-line justification in the PR body.
+- **Public-break = blocker, internal = self-resolve.** Anything that would change a publicly-observable surface (API shape, file path, schema, naming convention, semver bump) is a blocker requiring user clarification. CI/security config paths (`.github/`, branch-protection rulesets, `SECURITY.md`, lockfile pinning rules, build-system config) are also blockers — see the dispatch template's "Blocker handling" section for the full enumeration. Internal implementation choices the agent makes itself with a one-line justification in the PR body.
 - **Strict isolation.** Every dispatched agent runs with `isolation: worktree`. No file-state collisions.
 - **Best-effort context sharing.** When B declares a dependency on A and A has merged, B's dispatch prompt includes A's PR summary and any new types/helpers A introduced. Independent issues start cold.
 - **Concurrency cap: 3.** Three agents in flight at once. "In flight" = actively implementing or addressing review. An agent that has set automerge and returned `AUTOMERGE_SET` does not count toward the cap — the orchestrator's shell monitor (Phase 5b) drives the PR to merge from there, escalating to focused mini-agents only when judgment is required.
@@ -568,7 +568,17 @@ Then return `AUTOMERGE_SET <pr-url>` as the structured output (or `MERGED <pr-ur
 
 If at ANY point you hit a *publicly-observable* ambiguity that would change file paths, API shapes, schemas, or naming conventions — STOP. Do NOT guess.
 
-1. Post a comment on the issue describing exactly what you need (be specific — name the file, the field, the option):
+Changes under any of the following are blockers — even with strong justification. Surface to the user with the proposed diff inline; do not self-justify in the PR body:
+
+- `.github/` (workflows, actions, codeql config, dependabot config, issue/PR templates)
+- branch-protection rulesets
+- security policies (`SECURITY.md`, threat-model docs)
+- dependency-lockfile pinning rules
+- build-system config (`lefthook.yml`, `treefmt.toml`, taskfile target additions/removals)
+
+The justification still belongs in the PR body — but the user gets to confirm before the change goes in. Nothing under `.github/` qualifies as an "internal" decision.
+
+1. Post a comment on the issue describing exactly what you need (be specific — name the file, the field, the option; for the CI/security-config paths above, attach the proposed diff inline):
 
    gh issue comment <N> --body 'Claude: Blocked — <specific question>'
 
@@ -578,7 +588,7 @@ If at ANY point you hit a *publicly-observable* ambiguity that would change file
 
 3. Return a structured report to the orchestrator: `BLOCKED: <issue> <question>`.
 
-Internal implementation decisions (test layout, helper names, internal refactor choices) are NOT blockers — resolve them yourself with one-line justification in the PR body.
+Internal implementation decisions (test layout, helper names, internal refactor choices) are NOT blockers — resolve them yourself with one-line justification in the PR body. The CI/security-config paths enumerated above are explicitly *not* internal, regardless of how narrowly scoped or well-justified the change is.
 
 ### Usage-cap exhaustion (recoverable pause)
 
