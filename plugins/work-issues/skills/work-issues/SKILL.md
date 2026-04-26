@@ -76,6 +76,8 @@ If a label doesn't exist in the repo, create it once via `gh label create` (see 
 - Fix the root cause; don't pin around it, disable the check, or retry blindly.
 - Environmental / flaky failures (infra outage, rate limit, unrelated to this PR's diff) get reported but not retried — surface the issue rather than re-running.
 
+**A check passing 'success' isn't the same as the check doing its job.** If a workflow has a "check secrets" guard and exits 0 when secrets are missing, the side effect (committed file, set label, posted comment) won't happen. When you see a downstream check fail because an upstream artifact is missing (e.g. `changelog-lint` failing because no `pr-<N>-*.yml` exists, when a `changelog-bot` workflow ran and reported success), look at the upstream workflow's logs for `secrets not configured`-style notices before assuming a race or retrying.
+
 ## Phase 1 — Intake
 
 Resolve the issue list:
@@ -96,6 +98,23 @@ gh api "repos/:owner/:repo/issues/<n>/sub_issues" --jq '.[].number'
 ```
 
 Exclude any issue that is closed, has the `released` label, or is currently labelled `in-progress` by a different active session (check the comment trail to disambiguate). Surface a one-line note for each excluded issue.
+
+### Auto-memory sweep for known-broken CI / manual workarounds
+
+Sweep `~/.claude/projects/<project-slug>/memory/` for entries matching `*_bot_secrets*`, `*_broken*`, `*_pending*`, or whose body contains `manual workaround` / `skip silently` / `secrets not configured`. Inject any matches into every dispatch prompt under a "Known-broken CI / manual workarounds in this project" section.
+
+An inline `find` + `grep` pipeline is sufficient — no helper script required. For example:
+
+```bash
+slug=$(pwd | sed 's:/:-:g')
+mem="$HOME/.claude/projects/${slug}/memory"
+{
+  find "$mem" -maxdepth 1 -type f \( -name '*_bot_secrets*' -o -name '*_broken*' -o -name '*_pending*' \) 2>/dev/null
+  grep -lE 'manual workaround|skip silently|secrets not configured' "$mem"/*.md 2>/dev/null
+} | sort -u
+```
+
+If the sweep returns hits, paste each matched file's body verbatim into the dispatched agent's prompt under the "Known-broken CI / manual workarounds in this project" heading (see the dispatch template below). If the sweep returns nothing, omit the section.
 
 ## Phase 1.5 — Observe current PR conventions
 
@@ -302,6 +321,11 @@ Current PR conventions (observed from the most recent merged PRs — `CLAUDE.md`
 <if any deps merged: Dependency context — these issues already merged and may have introduced helpers / types / files you should reuse:
 - #<dep>: <PR title>. Summary: <one-line summary of what merged>.>
 
+<if the Phase 1 auto-memory sweep returned hits:
+Known-broken CI / manual workarounds in this project (swept from `~/.claude/projects/<slug>/memory/` — assume current unless the entry is dated stale):
+- <verbatim body of each matched memory entry, separated by `---`>
+Treat these as ground truth for known gaps in this project's CI / bots — don't waste time rediscovering them, and follow any documented manual workaround.>
+
 ## Pipeline
 
 You run in an isolated worktree (Claude Code's `isolation: worktree` already created it). Confirm with `git status` and `pwd`. Branch off latest `main`:
@@ -340,7 +364,11 @@ Conventional commit messages with `Signed-off-by:` if the project has DCO. Commi
   gh pr create --title "<conventional-commits subject>" \
                --body "<body matching project's PR template; include Closes #<N>>"
 
-### 6. Code-review subagent
+### 6. Review and merge loop
+
+Steps 6.1 through 6.5 form a single phase: spawn the review subagent, address whatever it finds, address any CI failures, set automerge, then drive the PR to merge. **The review subagent's findings are not your final output** — they are the *start* of the merge loop. The only valid terminal returns from this phase are `MERGED`, `MERGED-PENDING`, `BLOCKED`, `PAUSED`, or `ERRORED` (see Output section).
+
+#### 6.1 Spawn review subagent
 
 Spawn ONE Agent (subagent_type: general-purpose, run_in_background: false) to review the PR. Use this prompt:
 
@@ -356,9 +384,9 @@ Spawn ONE Agent (subagent_type: general-purpose, run_in_background: false) to re
   >
   > Use the `Claude Reviewer: ` prefix on every comment. If the diff is clean (no findings), post a single PR comment via `gh pr comment <pr#> --body 'Claude Reviewer: LGTM. <one-line summary of what you checked>'` and return.
 
-Wait for it to complete.
+Wait for it to complete. **When it returns, do NOT report its findings back to the orchestrator — proceed immediately to 6.2.**
 
-### 7. Address review comments
+#### 6.2 Address findings
 
 Fetch unaddressed comments:
 
@@ -382,7 +410,9 @@ Also check issue-level PR comments:
 
 Issue-level comments don't have thread replies — reply with a new issue comment prefixed `Claude: `.
 
-### 8. Address CI failures
+If the only review output is a single `Claude Reviewer: LGTM` issue-level comment, there are no findings to address — proceed to 6.3.
+
+#### 6.3 Address CI failures
 
 Fetch PR status:
 
@@ -403,9 +433,9 @@ That merges the latest base into the PR branch and re-fires every workflow on th
 
 If the failure is environmental (infra outage, rate limit, unrelated to your diff): report it in the PR body and skip — do not retry blindly.
 
-### 9. Set automerge and hand off
+#### 6.4 Set automerge
 
-Once review comments are addressed AND CI is green:
+Once review comments are addressed AND CI is green (or known-environmental):
 
   gh pr merge <pr#> --auto --squash
 
@@ -413,9 +443,9 @@ The merge happens automatically once all required checks pass.
 
 **Default: hand off to the orchestrator now.** Return `MERGED-PENDING <pr-url>` and exit. The orchestrator monitors the merge from here (handles `BEHIND`, conflict resolution, and final merge confirmation). This frees your slot for the next issue ~10 minutes sooner per PR.
 
-Only continue to step 10 if the orchestrator's dispatch prompt explicitly told you to "stay alive through merge."
+Only continue to 6.5 if the orchestrator's dispatch prompt explicitly told you to "stay alive through merge."
 
-### 10. (Optional) Monitor until merged
+#### 6.5 Monitor until merged (only if asked)
 
 If asked to stay through merge, loop every ~5 minutes:
 
@@ -439,9 +469,32 @@ Until merged:
   - Run the project's check task (`task check`, `scripts/lint.sh`, `npm test`, etc.) to confirm.
   - Commit the merge, push.
 
-- **CI failure after automerge**: investigate per step 8, push fix.
+- **CI failure after automerge**: investigate per 6.3, push fix.
 
 When `state == "MERGED"`: return `MERGED <pr-url>`. The worktree is automatically cleaned up by `isolation: worktree`.
+
+#### Worked example: review came back clean
+
+When the 6.1 subagent returns and the only output is `Claude Reviewer: LGTM`, the next tool calls in this turn should be (no narration to the orchestrator in between):
+
+```bash
+# 6.2 — confirm there are no inline findings to address.
+gh api 'repos/{owner}/{repo}/pulls/<pr#>/comments' --paginate \
+  --jq '[.[] | select(.body | startswith("Claude Reviewer: "))] | length'
+# expected: 0
+
+# 6.3 — confirm CI is green (or only environmental failures).
+gh pr view <pr#> --json statusCheckRollup \
+  --jq '[.statusCheckRollup[] | select(.conclusion=="FAILURE")] | length'
+# expected: 0 (or only known-environmental — see 6.3 for handling)
+
+# 6.4 — set automerge and hand off.
+gh pr merge <pr#> --auto --squash
+```
+
+Then return `MERGED-PENDING <pr-url>` as the structured output. Do not summarise the review back to the orchestrator; the LGTM comment is on the PR for the orchestrator's digest to pick up directly.
+
+**You have only completed your task when you return `MERGED`, `BLOCKED`, or `ERRORED`. Returning the review subagent's findings is not a valid output. If the review is clean (only `Claude Reviewer: LGTM`), immediately set automerge and proceed to the monitor sub-step. Do not summarise the review back to the orchestrator.**
 
 ## Blocker handling
 
@@ -482,6 +535,8 @@ Return EXACTLY ONE of these strings, ONCE, at the very end. Do not narrate progr
 - `BLOCKED <N> <question>` — parked on a public-break ambiguity awaiting clarification.
 - `PAUSED <N> <reason>` — environmentally paused (usage cap, infra outage). Orchestrator may re-dispatch when the condition clears.
 - `ERRORED <N> <error>` — non-recoverable failure.
+
+If you find yourself thinking "the review is done, I should report back" — don't. The review is the *start* of the merge loop, not the end.
 ```
 
 ## Phase 6 — Post-completion housekeeping
