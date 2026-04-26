@@ -78,6 +78,10 @@ If a label doesn't exist in the repo, create it once via `gh label create` (see 
 
 **A check passing 'success' isn't the same as the check doing its job.** If a workflow has a "check secrets" guard and exits 0 when secrets are missing, the side effect (committed file, set label, posted comment) won't happen. When you see a downstream check fail because an upstream artifact is missing (e.g. `changelog-lint` failing because no `pr-<N>-*.yml` exists, when a `changelog-bot` workflow ran and reported success), look at the upstream workflow's logs for `secrets not configured`-style notices before assuming a race or retrying.
 
+### Common gotchas
+
+**Trigger-surface widening triggers retroactive CodeQL findings.** If your PR adds `workflow_run` or `pull_request_target` as a trigger to any workflow file, audit *every* `run:` block in that file for inline `${{ steps.* }}`, `${{ github.event.* }}`, or `${{ inputs.* }}` interpolations. CodeQL will treat values flowing from the new trigger as untrusted, and existing safe-looking interpolations become `js/actions/command-injection` findings. Convert affected interpolations to the `env:` block + `${VAR}` shell expansion pattern that the rest of the file likely already uses. Run the local CodeQL action if available, or expect a CI failure on first push.
+
 ## Phase 1 — Intake
 
 Resolve the issue list:
