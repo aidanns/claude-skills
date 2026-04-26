@@ -779,8 +779,17 @@ The `Monitor` tool surfaces each stdout line of `monitor-pr.sh` as a notificatio
 | `CLOSED <pr-url>` | Surface to user — PR was closed without merging. Stop the monitor. |
 | `BEHIND_RESOLVED <pr#>` | Log only. Refresh the next progress digest. |
 | `CONFLICT <pr#> <branch> <base> <files>` | Dispatch the **conflict-resolution mini-agent** (template below). |
-| `CI_FAILURE <pr#> <check> <run-id>` | Dispatch the **CI-failure-fix mini-agent** (template below). |
+| `CI_FAILURE <pr#> <check> <run-id>` | Size the fix first (see **CI-failure sizing rule** below). If ≤50 lines / 1-2 files, fix in-place at the orchestrator level. Otherwise dispatch the **CI-failure-fix mini-agent** (template below). |
 | `NEW_COMMENT <pr#> <comment-id>` | Dispatch the **review-comment mini-agent** (template below). |
+
+#### CI-failure sizing rule
+
+On a `CI_FAILURE` event during the wait-for-merge tail, investigate before dispatching: `gh run view <run-id> --log-failed`, find root cause, don't bypass. Then size the fix:
+
+- **≤50-line fix in 1-2 files** (typecheck error, lint violation, missing import, sub-block in same file): **fix in place at the orchestrator level.** Do not pay the mini-agent cold-load. Use the existing branch — the implementing agent's worktree may still exist on disk at `.claude/worktrees/agent-<id>` and is reusable; otherwise check out the branch into a fresh worktree. Commit, push, let CI re-fire. The implementing agent is gone but the branch and PR are still yours.
+- **Larger fix, multi-file refactor, or new test surface required**: dispatch the CI-failure-fix mini-agent (template below). Pays a cold-load but safer for non-trivial changes.
+
+Either way, the implementing agent's terminal `AUTOMERGE_SET` return is final — don't try to "wake it up." The slot stays free for new issues.
 
 Mini-agents run in their own isolated worktrees with `run_in_background: true`. They do **not** count against the implementing-agent concurrency cap of 3 — they're focused, short-lived, and are part of a PR that has already cleared the implementing-agent slot. (Cap them informally if you observe contention; defer formal limits until needed.)
 
