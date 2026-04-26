@@ -376,6 +376,32 @@ Example tick output:
 #340 — implementing
 ```
 
+#### Notification-relay policy
+
+Phase 5b's shell monitor and progress-tick output produce a steady drip of events during the wait-for-CI / wait-for-merge tail. Most are heartbeats — they confirm "still going" but don't carry information the user needs to act on. The TaskList badge's `in_progress` rendering already conveys "this is still going"; relaying a chat line for every heartbeat is redundant noise on top of it. **TaskList rendering is the user-facing surface for in-progress state — silence is the default during heartbeat events.** Only emit a chat-visible line for state transitions.
+
+Apply this filter before relaying any event to the user:
+
+**Always relay** — these are state transitions worth surfacing as a chat line (and a digest tick):
+
+- PR opened (URL first appears in the digest — agent transitioned out of `implementing`).
+- Code-review subagent finished (review state moves from `pending` to `done`).
+- Implementing-agent terminal returns: `AUTOMERGE_SET`, `MERGED`, `BLOCKED`, `PAUSED`, `ERRORED`.
+- Phase 5b shell-monitor events: `MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`.
+- Phase 5b mini-agent terminal returns: `RESOLVED` (conflict-resolution), `FIXED` (CI-failure-fix), `ADDRESSED` (review-comment), `ENVIRONMENTAL` (CI-failure-fix flake/infra).
+- A new check `conclusion == "FAILURE"` newly observed in the rollup (the digest's `CI: red` count goes up).
+- A new merge conflict newly observed (`mergeStateStatus == "DIRTY"` newly seen — the digest's `merge: conflict` first appears).
+- Merge bot didn't fire after CI went green (the tier 2 / tier 3 escalation under "Tiered remediation when AUTOMERGE_SET stalls" — the user needs to see that the orchestrator is escalating).
+
+**Suppress** — these are heartbeats; the TaskList badge is already conveying them and a chat line would be doubly redundant:
+
+- Repeated `BEHIND_RESOLVED` events from Phase 5b's shell monitor beyond the first occurrence in a given monitor session (the auto-resolve is working as designed; one notification establishes that, the rest are noise).
+- The harness's spurious post-termination "agent completed" notifications after a dispatched agent has already returned its terminal token (per the duplicate-notification note — the agent is already done, the second fire is harness-level noise).
+- Progress-tick lines whose state hasn't changed since the prior tick (every digest field — review / CI / merge — produces the same string as last tick). Skip the chat-visible emission; the next tick that surfaces a real change re-emits the full digest.
+- Per-check-pass heartbeats from any agent or monitor ("`unit` passed, 2 more pending", "More checks passing"). The aggregate `CI: pending (<done>/<total>)` field already renders progress in the digest; per-check chatter doesn't add information.
+
+When in doubt, suppress. The user can always `gh pr view <pr#>` if they want raw detail; the orchestrator's job is to surface transitions, not narrate the wait.
+
 ### Dispatch prompt template (embedded in every Agent call)
 
 The orchestrator constructs the per-agent prompt by filling in the placeholders below. The full text — not a reference — goes into the Agent call so the dispatched agent has everything it needs without consulting this skill.
