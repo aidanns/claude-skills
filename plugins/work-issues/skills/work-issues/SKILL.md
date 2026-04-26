@@ -227,6 +227,8 @@ gh label create blocked --color B60205 \
   --description "Awaiting clarification before work can resume" 2>/dev/null || true
 gh label create in-progress --color FBCA04 \
   --description "A running Claude Code session is working on this issue" 2>/dev/null || true
+gh label create paused --color D4C5F9 \
+  --description "A running Claude Code session is paused on this issue (recoverable — usage cap, infra outage)" 2>/dev/null || true
 ```
 
 ## Phase 5 — Execution loop
@@ -530,7 +532,7 @@ If you hit a usage / quota cap mid-implementation (e.g. "out of extra usage · r
 
 1. Push whatever in-progress work is committable (commit the partial diff so the next agent can resume).
 2. Comment on the issue: `gh issue comment <N> --body 'Claude: Paused — usage cap, resumes <reset-time>. Branch: <branch-name>'`
-3. Apply `paused` (or `blocked` if no `paused` label exists) and remove `in-progress`:
+3. Apply `paused` and remove `in-progress`:
 
        gh issue edit <N> --add-label paused --remove-label in-progress
 
