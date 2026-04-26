@@ -131,6 +131,7 @@ gh pr list --state merged --limit 5 --json number,title,body,labels --jq '.[]'
 Look for patterns the dispatched agent needs to match that may not be in `CLAUDE.md`:
 
 - **Title prefix style** — Conventional Commits (`feat:`, `fix:`) vs. a project-specific allowlist (`feature:`, `improvement:`, `chore:`). Use whatever recently-merged titles consistently use.
+- **Title length limit** — the dispatch template defaults to ≤72 chars (standard commit-subject convention). If the repo has a commit-message-lint workflow (`.github/workflows/*commit*lint*.yml`, `commitlint.config.*`, etc.) with a different `subject-max-length`, surface the actual limit in the observations block so the dispatched agent uses the correct number.
 - **Body format** — does the body wrap the commit message in a delimited block (e.g. `==COMMIT_MSG==`)? Where do `Closes #N` and `Signed-off-by:` sit (inside the block, or outside)?
 - **Labels at merge time** — is there a `no changelog` / `automerge` / similar label that's consistently applied? Does the project use a merge-bot that requires a specific label?
 - **Manual changelog entry** — do recently-merged PRs touch `changelog/@unreleased/pr-<N>-<slug>.yml` or similar? If so, the dispatched agent must hand-author one (or apply a `no changelog` label for non-user-visible changes).
@@ -443,6 +444,13 @@ Conventional commit messages with `Signed-off-by:` if the project has DCO. Commi
 
   gh pr create --title "<conventional-commits subject>" \
                --body "<body matching project's PR template; include Closes #<N>>"
+
+**PR title must be ≤72 characters.** It becomes the squash-merge subject inside the `==COMMIT_MSG==` block (or the equivalent commit-subject convention in repos without that pattern). If your tentative title is longer, tighten it before opening the PR. Common compaction patterns:
+
+- Drop redundant prepositions: "optional per-key signing passphrase **stored in** system keyring" → "optional per-key signing passphrase **via** keyring".
+- Drop scope qualifiers already implied by the prefix: `feature(gpg-bridge): gpg-bridge supports …` → `feature(gpg-bridge): supports …`.
+
+Failing the title-length check costs an amend + force-push and an extra CI cycle.
 
 ### 6. Review and merge loop
 
