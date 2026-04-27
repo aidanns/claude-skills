@@ -30,7 +30,7 @@ Selectors compose: `/workflow:implement --milestone "MS-2 General" --label sched
 - **Public-break = blocker, internal = self-resolve.** Anything that would change a publicly-observable surface (API shape, file path, schema, naming convention, semver bump) is a blocker requiring user clarification. CI/security config paths (`.github/`, branch-protection rulesets, `SECURITY.md`, lockfile pinning rules, build-system config) are also blockers — see the dispatch template's "Blocker handling" section for the full enumeration. Internal implementation choices the agent makes itself with a one-line justification in the PR body.
 - **Strict isolation.** Every dispatched agent runs with `isolation: worktree`. No file-state collisions.
 - **Best-effort context sharing.** When B declares a dependency on A and A has merged, B's dispatch prompt includes A's PR summary and any new types/helpers A introduced. Independent issues start cold.
-- **Concurrency cap: 3.** Three agents in flight at once. "In flight" = actively implementing or addressing review. An agent that has set automerge and returned `AUTOMERGE_SET` does not count toward the cap — the orchestrator's shell monitor (Phase 5b) drives the PR to merge from there, escalating to focused mini-agents only when judgment is required.
+- **Concurrency cap: 3.** Three implementing agents in flight at once. "In flight" = actively implementing (i.e. running through the dispatch pipeline up to `READY_FOR_REVIEW`). An implementing agent that has signalled `READY_FOR_REVIEW` and exited frees its slot — the orchestrator dispatches review / address-review / merge-handoff at its own level (review subagent and address-review mini-agent are short-lived and do not count toward the cap), and the Phase 5b shell monitor drives the PR to merge after automerge is set, escalating to focused mini-agents only when judgment is required.
 - **Drop the cap to 1 on hot-main / shared-path batches.** The default of 3 assumes the in-flight PRs touch independent code paths, so each merges cleanly without disturbing the others. If the in-scope PRs all touch release-relevant or shared paths (anything that triggers a release-PR refresh, version-file edits, lockfile updates, or the same hot file), or the project's `main` is observed to move more than ~2 commits during a typical PR's CI cycle, run with concurrency cap = 1 (serial dispatch) instead. The failure mode to recognise: a release-PR refresh loop where every merge to `main` fires another release-PR update that itself moves `main` again, leaving each in-flight PR stuck cycling through `BEHIND → resolve → CI re-run (~5–10 min) → still BEHIND because main moved again`. With cap > 1, the *last* PR pays for `n−1` CI cycles as `main` moves underneath it; with cap = 1, each PR pays for exactly one CI cycle. Keep the default at 3 — for independent code paths the parallel default is the right call; this is a hint for the specific distribution.
 
 ## Universal work conventions
@@ -73,7 +73,7 @@ If a label doesn't exist in the repo, create it once via `gh label create` (see 
 
 ### CI discipline
 
-- Read failure logs before acting (`bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/triage-ci-failure.sh" <repo> <run-id>` — emits a focused ~30-line summary; see Phase 5 § 6.3).
+- Read failure logs before acting (`bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/triage-ci-failure.sh" <repo> <run-id>` — emits a focused ~30-line summary; the CI-failure-fix mini-agent (Phase 5b) is the canonical caller).
 - Fix the root cause; don't pin around it, disable the check, or retry blindly.
 - Environmental / flaky failures (infra outage, rate limit, unrelated to this PR's diff) get reported but not retried — surface the issue rather than re-running.
 
@@ -140,9 +140,9 @@ The emitted block surfaces:
 - **`==COMMIT_MSG==` block** — required / optional / not used, based on how many recent merged PR bodies wrap their commit message in that block. The same logic generalises to whatever named-block convention surfaces in the sample.
 - **Labels at merge time** — a histogram of every label seen across the sample (label → `<n>/<sample-size>`), so the dispatched agent can spot consistently-applied ones (`automerge`, `no changelog`, etc.).
 - **Manual changelog entries** — required / occasional / not observed, computed from how many recent PRs touched a `changelog/@unreleased/pr-<N>-<slug>.yml` file.
-- **Merge mechanism** — emitted as the `Merge mechanism:` trailer. Sub-step 6.4 of the dispatch template parses this line. Two-signal heuristic (preserved verbatim from the prior prose): (1) a workflow that listens to `pull_request: types: [labeled]` with a label-name guard, (2) that label appearing on at least half of the recent merged PRs. If both signals agree, the value is `apply <label> label (merge-bot picks it up)`; otherwise the default is `gh pr merge --auto --squash` (native auto-merge).
+- **Merge mechanism** — emitted as the `Merge mechanism:` trailer. The orchestrator's Phase 5 step 5 LGTM / `READY_TO_MERGE` branches parse this line to decide whether to apply a merge-trigger label or run `gh pr merge --auto --squash`. Two-signal heuristic (preserved verbatim from the prior prose): (1) a workflow that listens to `pull_request: types: [labeled]` with a label-name guard, (2) that label appearing on at least half of the recent merged PRs. If both signals agree, the value is `apply <label> label (merge-bot picks it up)`; otherwise the default is `gh pr merge --auto --squash` (native auto-merge).
 
-If the helper script is unavailable for any reason (e.g. the plugin install is corrupted), the orchestrator can fall back to running the steps inline — but treat that as a degraded path and flag it. The script's output is the contract; sub-step 6.4 of the dispatch template depends on the `Merge mechanism:` trailer being present.
+If the helper script is unavailable for any reason (e.g. the plugin install is corrupted), the orchestrator can fall back to running the steps inline — but treat that as a degraded path and flag it. The script's output is the contract; the orchestrator's merge handoff depends on the `Merge mechanism:` trailer being present.
 
 ## Phase 2 — Pre-flight clarification
 
@@ -202,7 +202,8 @@ Track task lifecycle in lockstep with the issue label lifecycle:
 
 - On dispatch (Phase 5 step 2): `TaskUpdate(status: "in_progress")` — issued as a **standalone tool call**, not bundled with the `gh issue edit` label flip or the `Agent` dispatch. See Phase 5 step 2 and the "Why standalone TaskUpdate" note in Phase 6 for the cancellation hazard.
 - On `MERGED` notification (Phase 5 step 5): `TaskUpdate(status: "completed")` — issued as a **standalone tool call** in Phase 6 step 1, not bundled with the worktree / pull / label cleanup. Same reasoning.
-- On `AUTOMERGE_SET`: leave the task `in_progress`; flip to `completed` when the Phase 5b shell monitor emits `MERGED`.
+- On `READY_FOR_REVIEW` / `READY_TO_MERGE` (mid-pipeline implementing-agent and address-review terminal returns): leave the task `in_progress`. The orchestrator dispatches the next phase (review subagent or merge handoff) and flips to `completed` only when the Phase 5b shell monitor emits `MERGED`.
+- On orchestrator-internal `automerge_set` state (after the orchestrator runs the merge handoff): same — leave `in_progress`; flip to `completed` when the Phase 5b shell monitor emits `MERGED`.
 - On `BLOCKED` / `PAUSED`: leave `in_progress`; update the task `description` with the parked question / pause reason so the task list surfaces *why* it is parked, not just that it is.
 
 For dependencies declared in Phase 3, set `addBlockedBy` on the dependent task so the task list reflects the dispatch order.
@@ -290,28 +291,45 @@ Loop until every issue is terminal (merged, parked, or excluded):
 
 4. **Dispatch agent** with `isolation: worktree`, `run_in_background: true`. Use the **dispatch prompt template** below. This is its own tool-call group — do not parallelise the `Agent` call with the `TaskUpdate` from step 2 or the `gh issue edit` from step 3.
 
-5. **Monitor** — Claude Code notifies the orchestrator when each background agent completes. On notification:
-   - **MERGED**: GitHub closed the issue via `Closes #<n>`. Mark task done; pick up the next eligible issue. Do **not** fire a `PushNotification` — heartbeat-grade once the TaskList badge flips to `completed`.
-   - **AUTOMERGE_SET**: agent set automerge and exited. Slot is now free — pick up the next eligible issue. The orchestrator hands off to **Phase 5b** (post-automerge monitoring): a thin shell monitor polls the PR; auto-resolves `BEHIND` in-shell; emits events that the orchestrator routes to focused mini-agents for `CONFLICT` / `CI_FAILURE` / `NEW_COMMENT`; exits on `MERGED`. **Review-fallback check:** if the PR body contains a `### Self-review only` section (the implementing agent's harness lacked the `Task` / `general-purpose` subagent type), dispatch a separate review subagent at the orchestrator level *before* the merge lands. Use the same review prompt the dispatch template's 6.1 would have used and treat its output as a normal review pass — any findings flow back to the PR via inline `Claude Reviewer: ` comments and the Phase 5b monitor's `NEW_COMMENT` event will route them to the review-comment mini-agent. Do **not** fire a `PushNotification` — the slot-free transition is heartbeat-grade once the TaskList badge conveys it.
+5. **Monitor** — Claude Code notifies the orchestrator when each background agent completes. On notification, route by terminal token. The state machine across the implementing → reviewing → (LGTM | addressing) → merging pipeline:
+
+   ```
+   implementing  --[READY_FOR_REVIEW]-->  reviewing
+   reviewing     --[LGTM]-->              merging        (orchestrator sets automerge)
+   reviewing     --[findings]-->          addressing
+   addressing    --[READY_TO_MERGE]-->    merging        (orchestrator sets automerge)
+   merging       --[Phase 5b shell monitor drives the PR to MERGED]
+   ```
+
+   Each transition is an orchestrator action, parsed from a literal terminal token in the agent's `result` field. The implementing agent never sets automerge; the orchestrator does, after review (and address-review, if findings landed).
+
+   Routing per token:
+
+   - **READY_FOR_REVIEW**: implementing agent finished step 6 (PR open, self-review of own diff complete). Slot is now free — pick up the next eligible issue. Dispatch the **review subagent** at the orchestrator level (template embedded below — same prompt the previous dispatch step 6.1 used). When it returns, branch on findings:
+     - **Zero findings (LGTM)** — the only review output is a single `Claude Reviewer: LGTM` PR-level comment and there are zero inline `Claude Reviewer:` comments. The orchestrator sets automerge per the observed `Merge mechanism:` line (apply the configured label, or run `gh pr merge --auto --squash` for the native-auto-merge default), then hands off to **Phase 5b** (post-automerge monitoring). Internally mark the issue as `automerge_set` (the slot was already free; this just records the merge handoff for digest tracking).
+     - **≥1 finding** — at least one inline `Claude Reviewer:` comment landed. Dispatch the **address-review mini-agent** (template in Phase 5b's mini-agent section) on the implementing agent's branch. It reads unaddressed `Claude Reviewer:` comments, addresses each, commits, pushes, threads `Claude: Done!` replies, and returns `READY_TO_MERGE <pr-url>`.
+     Do **not** fire a `PushNotification` — these are mid-pipeline transitions, not user-action handoffs. The TaskList badge stays `in_progress` through review and address-review; the digest's `review:` field surfaces progress.
+   - **READY_TO_MERGE**: address-review mini-agent finished (or, in rare cases, came back from another orchestrator-owned phase). The orchestrator sets automerge per the observed `Merge mechanism:` line (same handoff as the LGTM branch above) and hands off to **Phase 5b**. Mark `automerge_set`. Do **not** fire a `PushNotification`.
+   - **MERGED**: GitHub closed the issue via `Closes #<n>`. Mark task done; pick up the next eligible issue. Do **not** fire a `PushNotification` — heartbeat-grade once the TaskList badge flips to `completed`. (This token is normally emitted by the Phase 5b shell monitor, not by an implementing agent.)
    - **BLOCKED**: ensure `blocked` label set, `in-progress` removed; record the question for batched surfacing in Phase 7. Fire one `PushNotification` summarising the parked issue and question — e.g. `PushNotification(message: "/implement: #<n> blocked — <question>")`. This is a terminal handoff back to the user; the OS notification is the bell that "user action needed" wants.
    - **PAUSED**: ensure `paused` (or `blocked`) label is set; record the reset time. Re-dispatch a resumption agent (Phase 5 step 0 path) after the condition clears. Fire one `PushNotification` summarising the pause — e.g. `PushNotification(message: "/implement: #<n> paused — <reason>")`. Same rationale as `BLOCKED`.
    - **ERRORED**: surface immediately to user; do not retry without instruction. Fire one `PushNotification` summarising the error — e.g. `PushNotification(message: "/implement: #<n> errored — <error>")`. Same rationale as `BLOCKED`.
-   - **Malformed terminal (no literal-prefix match)**: the agent's `result` field doesn't start with one of the five terminal tokens above (`AUTOMERGE_SET`, `MERGED`, `BLOCKED`, `PAUSED`, `ERRORED`). The realistic distribution is "agent narrated 'polling for CI to finish' instead of returning AUTOMERGE_SET" — every bit of state needed to drive the PR home is observable on the PR itself. Run the **PR state reconstruction probe** below before falling back to ERRORED; the user only sees the malformed result string if the probe can't classify the state.
+   - **Malformed terminal (no literal-prefix match)**: the agent's `result` field doesn't start with one of the recognised terminal tokens (`READY_FOR_REVIEW`, `READY_TO_MERGE`, `MERGED`, `BLOCKED`, `PAUSED`, `ERRORED`). The realistic distribution is "agent narrated 'polling for CI to finish' instead of returning a token" — every bit of state needed to drive the PR home is observable on the PR itself. Run the **PR state reconstruction probe** below before falling back to ERRORED; the user only sees the malformed result string if the probe can't classify the state.
 
      Reconstruction probe — sequential checks, **first match wins**. All branches route to existing recovery infrastructure; no new mini-agent templates are introduced.
 
      1. **No PR exists yet.** `gh pr list --search "Closes #<n>" --state all --json number` returns `[]`. Re-dispatch with the resumption prompt (Phase 5 step 0 path); the agent died before opening a PR, so a fresh attempt is the only recovery.
-     2. **PR body contains `### Self-review only`, zero `Claude Reviewer:` comments.** The implementing agent's harness lacked the `Task` / `general-purpose` subagent type and review never ran. Dispatch the orchestrator-level review subagent (the same review-fallback path the AUTOMERGE_SET branch above triggers — same prompt the dispatch template's 6.1 would have used). After it returns, re-enter the probe at step 4 (its inline `Claude Reviewer:` comments may now need addressing, and CI may have moved).
-     3. **Unaddressed `Claude Reviewer:` comments exist.** Top-level reviewer comments with no replying comment in their thread. Dispatch the **review-comment mini-agent** (Phase 5b template) per unaddressed comment. The Phase 5b monitor — once launched in step 5 — will pick up subsequent comments via `NEW_COMMENT` events, but at this point no monitor is running so the orchestrator dispatches directly.
+     2. **PR exists, zero `Claude Reviewer:` comments (review never ran).** The implementing agent likely died after `gh pr create` but before signalling `READY_FOR_REVIEW`. Treat as if `READY_FOR_REVIEW` was the (recovered) terminal: dispatch the orchestrator-level review subagent (same path the `READY_FOR_REVIEW` branch above takes). After it returns, the LGTM / findings branch logic in step 5 picks up — re-enter the probe at step 4 if needed (CI may have moved while you were here).
+     3. **Unaddressed `Claude Reviewer:` comments exist.** Top-level reviewer comments with no replying comment in their thread. Dispatch the **address-review mini-agent** (Phase 5b template — same path the "≥1 finding" branch in step 5 uses). When it returns `READY_TO_MERGE`, the orchestrator sets automerge per the observed `Merge mechanism:` line and hands off to Phase 5b's shell monitor.
      4. **CI red.** `gh pr view <pr#> --json statusCheckRollup` shows any check with `conclusion == "FAILURE"`. Apply the **CI-failure sizing rule** (Phase 5b): ≤50-line / 1–2-file fix in place at the orchestrator level, otherwise dispatch the **CI-failure-fix mini-agent** (Phase 5b template). Same stale-aggregator short-circuit applies.
-     5. **CI green, review done, `automerge` label not applied.** The agent reached the merge handoff but didn't return cleanly. Apply the merge-trigger label per the PR's observed `Merge mechanism:` line (typically `automerge`; read the merge workflow's `on:` block to confirm) and launch the **Phase 5b shell monitor** as if AUTOMERGE_SET had been returned cleanly.
-     6. **Reconstruction can't classify** (e.g. PR exists, body has no `### Self-review only` marker, no review comments, CI green, automerge label already applied — yet the agent's malformed result string suggests something is wrong). Fall through to ERRORED: fire the `PushNotification` with the captured `result` string verbatim and surface to the user. This is the safety net — never silently drop a malformed terminal.
+     5. **CI green, review done, merge-trigger not applied.** The pipeline reached the merge handoff but didn't return cleanly. Apply the merge-trigger per the PR's observed `Merge mechanism:` line (`gh pr edit <pr#> --add-label <label>` for label-triggered merge-bots, or `gh pr merge <pr#> --auto --squash` for native auto-merge) and launch the **Phase 5b shell monitor**.
+     6. **Reconstruction can't classify** (e.g. PR exists, review done, no unaddressed comments, CI green, automerge label already applied — yet the agent's malformed result string suggests something is wrong). Fall through to ERRORED: fire the `PushNotification` with the captured `result` string verbatim and surface to the user. This is the safety net — never silently drop a malformed terminal.
 
      Each branch except (6) maps 1:1 to existing recovery infrastructure already wired up elsewhere in this skill — the probe is a router, not new behaviour.
 
    The harness occasionally fires duplicate `task-notification` events for an agent after it has already terminated — recognisable by 0 tool uses and a generic-sounding result string. Ignore these; rely on your own Monitor task or PR-state polling for ground truth. (And do not re-fire `PushNotification` on a duplicate — the bell already rang on the real terminal.) **Distinguish a duplicate from a malformed terminal:** duplicates have 0 tool uses and follow a real terminal that already parsed cleanly; a malformed terminal is the agent's *first and only* terminal notification, with non-zero tool uses, and its `result` simply doesn't prefix-match. Only the latter triggers the reconstruction probe.
 
-   **Why `PushNotification` here, not `Stop`.** The orchestrator is a long-lived loop on `Monitor` / `TaskOutput` events; the model finishes a turn and goes briefly idle waiting for the next async event many times during a run. In Claude Code that idle transition fires the `Stop` hook on every cycle, so users with a bell-on-`Stop` configuration hear a constant drip even though no action is required. `Stop` cannot reliably distinguish "model is done with the whole orchestration" from "model finished this Monitor tick and will resume on the next event" — both are turn boundaries, and the hook payload doesn't carry a reliable signal. `PushNotification` is the surface the harness reserves for "user action needed" (permission prompts, idle, and explicit `PushNotification` tool calls), so firing it from the skill at the known-meaningful transitions — `BLOCKED` / `PAUSED` / `ERRORED` here, and the Phase 8 final-report bell — gives users with `Stop` removed the visibility they actually want without the heartbeat noise. `MERGED` and `AUTOMERGE_SET` are intentionally silent on the OS-notification channel: the TaskList badge already conveys completion and a bell on every per-issue success would re-introduce the same drip the move away from `Stop` was meant to fix.
+   **Why `PushNotification` here, not `Stop`.** The orchestrator is a long-lived loop on `Monitor` / `TaskOutput` events; the model finishes a turn and goes briefly idle waiting for the next async event many times during a run. In Claude Code that idle transition fires the `Stop` hook on every cycle, so users with a bell-on-`Stop` configuration hear a constant drip even though no action is required. `Stop` cannot reliably distinguish "model is done with the whole orchestration" from "model finished this Monitor tick and will resume on the next event" — both are turn boundaries, and the hook payload doesn't carry a reliable signal. `PushNotification` is the surface the harness reserves for "user action needed" (permission prompts, idle, and explicit `PushNotification` tool calls), so firing it from the skill at the known-meaningful transitions — `BLOCKED` / `PAUSED` / `ERRORED` here, and the Phase 8 final-report bell — gives users with `Stop` removed the visibility they actually want without the heartbeat noise. `READY_FOR_REVIEW`, `READY_TO_MERGE`, and `MERGED` are intentionally silent on the OS-notification channel: the TaskList badge already conveys progress, and a bell on every mid-pipeline transition or per-issue success would re-introduce the same drip the move away from `Stop` was meant to fix.
 
 6. **Continue** until all terminal.
 
@@ -343,7 +361,7 @@ The TaskCreate list (Phase 4) is the durable surface. Augment it with a chat-vis
 **Cadence:**
 
 - Emit a digest on every orchestrator wakeup tick while at least one issue is in-flight (`in-progress` or `automerge_set`). The next-wakeup interval is **state-based** rather than fixed — see the table below.
-- Immediately on every dispatched-agent terminal return (`MERGED`, `AUTOMERGE_SET`, `BLOCKED`, `PAUSED`, `ERRORED`) — emit a digest of the remaining in-flight set so the user sees the new state without waiting for the next tick.
+- Immediately on every dispatched-agent terminal return (`READY_FOR_REVIEW`, `READY_TO_MERGE`, `MERGED`, `BLOCKED`, `PAUSED`, `ERRORED`) — emit a digest of the remaining in-flight set so the user sees the new state without waiting for the next tick.
 - Immediately on every Phase 5b monitor event (`MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `STALLED_GREEN`, mini-agent `RESOLVED` / `FIXED` / `ADDRESSED`) — same digest line so the user sees what the shell monitor and its mini-agents are doing.
 
 **State-based wakeup interval:**
@@ -387,7 +405,7 @@ The script's exit code is always `0`; the orchestrator distinguishes outcomes vi
    - `state == CLOSED` (without merge) → `#<N> <pr-url> — closed (not merged)` (drop the issue from the in-flight set on subsequent ticks).
    - `state == OPEN` → continue with the per-state formatting below.
 
-2. **Review status** — count `Claude Reviewer:` comments via `gh api repos/<owner>/<repo>/pulls/<pr#>/comments` (inline) and `…/issues/<pr#>/comments` (PR-level). The review subagent (step 6 of the dispatch pipeline) posts either inline review comments or a single LGTM PR-level comment with the `Claude Reviewer: ` prefix (the implementing agent uses `Claude: `, so the prefix discriminates):
+2. **Review status** — count `Claude Reviewer:` comments via `gh api repos/<owner>/<repo>/pulls/<pr#>/comments` (inline) and `…/issues/<pr#>/comments` (PR-level). The orchestrator-level review subagent (dispatched on `READY_FOR_REVIEW`) posts either inline review comments or a single LGTM PR-level comment with the `Claude Reviewer: ` prefix (the implementing agent uses `Claude: `, so the prefix discriminates):
 
    - Both 0 → `review: pending`.
    - Inline count ≥ 1 → `review: done (<n> findings)`.
@@ -435,13 +453,15 @@ Apply this filter before relaying any event to the user:
 **Always relay** — these are state transitions worth surfacing as a chat line (and a digest tick):
 
 - PR opened (URL first appears in the digest — agent transitioned out of `implementing`).
-- Code-review subagent finished (review state moves from `pending` to `done`).
-- Implementing-agent terminal returns: `AUTOMERGE_SET`, `MERGED`, `BLOCKED`, `PAUSED`, `ERRORED`.
+- Implementing-agent terminal returns: `READY_FOR_REVIEW`, `BLOCKED`, `PAUSED`, `ERRORED`.
+- Orchestrator-level review subagent finished: `LGTM` (review state moves to `done (LGTM)`) or `FINDINGS <count>` (review state moves to `done (<count> findings)`).
+- Address-review mini-agent terminal return: `READY_TO_MERGE` (orchestrator is about to set automerge).
+- Orchestrator sets automerge (the LGTM or `READY_TO_MERGE` branch fires the merge handoff per the observed `Merge mechanism:` line) — this is the "merging" state in the state machine.
 - Phase 5b shell-monitor events: `MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `BEHIND_RESOLVE_FAILED` (the monitor's `git push` was rejected after a local catch-up — usually a PAT-scope issue; the PR is parked until the user intervenes), `STALLED_GREEN` (the merge bot didn't fire after CI went green; the orchestrator is running the tier 2 / 3 / 4 ladder).
 - Phase 5b mini-agent terminal returns: `RESOLVED` (conflict-resolution), `FIXED` (CI-failure-fix), `ADDRESSED` (review-comment), `ENVIRONMENTAL` (CI-failure-fix flake/infra).
 - A new check `conclusion == "FAILURE"` newly observed in the rollup (the digest's `CI: red` count goes up).
 - A new merge conflict newly observed (`mergeStateStatus == "DIRTY"` newly seen — the digest's `merge: conflict` first appears).
-- Merge bot didn't fire after CI went green (the tier 2 / tier 3 escalation under "Tiered remediation when AUTOMERGE_SET stalls" — the user needs to see that the orchestrator is escalating).
+- Merge bot didn't fire after CI went green (the tier 2 / tier 3 escalation under "Tiered remediation when automerge stalls" — the user needs to see that the orchestrator is escalating).
 
 **Suppress** — these are heartbeats; the TaskList badge is already conveying them and a chat line would be doubly redundant:
 
@@ -465,7 +485,7 @@ You are implementing GitHub issue #<N> end-to-end. The issue body follows verbat
 
 Project context: this repo's conventions are described in `CLAUDE.md` (root), `.claude/instructions/*.md` (if present), and `CONTRIBUTING.md`. Read these before editing — they define language, tooling, commit-message scopes, and any project-specific rules.
 
-<stdout of `phase15-conventions.sh <owner/repo>` embedded verbatim — a header line "Current PR conventions (observed from the N most recent merged PRs on <repo>)…" followed by bullets covering title prefix style, title length limit, ==COMMIT_MSG== block usage, label histogram, and manual-changelog status, terminated by a `Merge mechanism:` trailer that sub-step 6.4 below parses. Do not hardcode a merge command — sub-step 6.4 reads the trailer.>
+<stdout of `phase15-conventions.sh <owner/repo>` embedded verbatim — a header line "Current PR conventions (observed from the N most recent merged PRs on <repo>)…" followed by bullets covering title prefix style, title length limit, ==COMMIT_MSG== block usage, label histogram, and manual-changelog status, terminated by a `Merge mechanism:` trailer that the *orchestrator* parses when running the merge handoff (you, the implementing agent, do not — your terminal step is `READY_FOR_REVIEW`). The trailer is embedded for context: convention-aware PR bodies (e.g. picking the right `==COMMIT_MSG==` shape) still depend on it.>
 
 <if any deps merged: Dependency context — these issues already merged and may have introduced helpers / types / files you should reuse:
 - #<dep>: <PR title>. Summary: <one-line summary of what merged>.>
@@ -526,154 +546,29 @@ Conventional commit messages with `Signed-off-by:` if the project has DCO. Commi
 
 Failing the title-length check costs an amend + force-push and an extra CI cycle.
 
-### 6. Review and merge loop
+### 6. Signal ready for review — TERMINAL STEP
 
-Steps 6.1 through 6.4 form a single phase: spawn the review subagent, address whatever it finds, address any CI failures, then set automerge. **The review subagent's findings are not your final output** — they are the *start* of the merge loop. The only valid terminal returns from this phase are `AUTOMERGE_SET`, `MERGED`, `BLOCKED`, `PAUSED`, or `ERRORED` (see Output section). Setting automerge in 6.4 is your terminal step — the orchestrator's Phase 5b shell monitor drives the PR the rest of the way to merge.
+The PR is open. Your job ends here: signal `READY_FOR_REVIEW <pr-url>` and exit. Do **not** spawn a review subagent. Do **not** address review findings. Do **not** check CI. Do **not** apply automerge. The orchestrator owns review, address-review, CI-fix, and merge-handoff at its own level — that's a deliberate split so review always runs at full subagent-type access (a constraint the implementing agent's harness can't guarantee).
 
-#### 6.1 Spawn review subagent
+**Before signalling, do one last self-review pass on your own diff.** This is a code-quality step, not a review step — the orchestrator's review subagent is the independent reviewer. Re-read `git diff main...HEAD` and self-correct any obvious problems (dead code, unclear names, missing tests, scope creep, undocumented decisions). The earlier step 3 self-review covered pre-push; this is one more pass after the PR is up so you can address anything that only became visible in the PR view (e.g. a file you forgot to stage, a stray debug print). Push any fixes before signalling. **Don't iterate forever** — one pass; if you spot something genuinely contentious, leave it for the review subagent.
 
-Spawn ONE Agent (subagent_type: general-purpose, run_in_background: false) to review the PR. Use this prompt:
+Once the diff is clean, return immediately:
 
-  > You are reviewing PR #<pr#> on <repo>. Fetch the diff with `gh pr diff <pr#>`. Review it against the project's conventions documented in `CLAUDE.md`, `.claude/instructions/*.md`, and `CONTRIBUTING.md`. Look for: scope creep, undocumented decisions, missing tests, dead code, unclear naming, breaking changes that aren't called out, security issues, and convention violations.
-  >
-  > Post each finding as an inline comment via the GitHub API:
-  >
-  >   gh api --method POST 'repos/{owner}/{repo}/pulls/{pr#}/comments' \
-  >     -f body='Claude Reviewer: <finding>' \
-  >     -f commit_id='<head sha>' \
-  >     -f path='<file>' \
-  >     -f line=<line>
-  >
-  > Use the `Claude Reviewer: ` prefix on every comment. If the diff is clean (no findings), post a single PR comment via `gh pr comment <pr#> --body 'Claude Reviewer: LGTM. <one-line summary of what you checked>'` and return.
+- `READY_FOR_REVIEW <pr-url>` — PR is open, your self-review pass is done, the orchestrator can now dispatch the independent review subagent.
 
-**Fallback if the `Task` / `general-purpose` subagent type is unavailable in your harness.** Do NOT skip review. Self-review the diff against the same checklist the subagent would use (scope creep, undocumented decisions, missing tests, dead code, unclear naming, breaking changes that aren't called out, security issues, convention violations) and add a `### Self-review only` section to the PR body explicitly stating the subagent was unavailable and listing what you checked. Then proceed to 6.2 normally and return `AUTOMERGE_SET` as normal — the orchestrator's Phase 5 monitoring greps for `### Self-review only` and dispatches a review subagent at its own level to fill the gap.
+**Do not poll for CI. Do not narrate progress.** Returning `READY_FOR_REVIEW` frees your slot and hands the PR to the orchestrator's review → address-review → CI-fix → merge pipeline.
 
-Wait for it to complete. **When it returns, do NOT report its findings back to the orchestrator — proceed immediately to 6.2.**
+#### Worked example: PR open, self-review clean
 
-#### 6.2 Address findings
+After `gh pr create` returns the PR URL and your post-push self-review pass on `git diff main...HEAD` finds nothing to fix, the next action in this turn is the terminal return — no further tool calls:
 
-Fetch unaddressed comments:
-
-  gh api 'repos/{owner}/{repo}/pulls/{pr#}/comments' --paginate
-
-A comment is *unaddressed* when `in_reply_to_id == null` (top-level reviewer comment) AND no other comment's `in_reply_to_id` equals its `id`. For each unaddressed `Claude Reviewer: ` comment:
-
-1. Make the code change (or document why the suggestion shouldn't be adopted).
-2. Commit with a conventional-commit message.
-3. `git pull --rebase origin <branch>` then `git push`. Retry up to 3x on non-fast-forward.
-4. Post a threaded reply:
-
-   gh api --method POST 'repos/{owner}/{repo}/pulls/{pr#}/comments/{id}/replies' \
-     -f body='Claude: Done!'
-
-   If the suggestion was adopted as-is, use `Claude: Done!`. If you took a different approach, use `Claude: <one-line explanation>`.
-
-Also check issue-level PR comments:
-
-  gh api 'repos/{owner}/{repo}/issues/{pr#}/comments' --paginate
-
-Issue-level comments don't have thread replies — reply with a new issue comment prefixed `Claude: `.
-
-If the only review output is a single `Claude Reviewer: LGTM` issue-level comment, there are no findings to address — proceed to 6.3.
-
-**Note on conflict resolution.** A merge conflict that surfaces *before* you set automerge is yours to resolve in this loop. After you set automerge in 6.4, conflict resolution is delegated to the orchestrator's Phase 5b shell monitor, which dispatches a focused conflict-resolution mini-agent.
-
-#### 6.3 Address CI failures
-
-Fetch PR status:
-
-  gh pr view <pr#> --json statusCheckRollup
-
-For each entry with `conclusion == "FAILURE"`:
-
-1. Get a focused failure summary:
-
-       bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/triage-ci-failure.sh" <owner/repo> <databaseId>
-
-   The script emits ~30 lines: the failing step's name, up to 10 deduplicated error-marker lines (`error:|::error::|^FAILED|Traceback|assertion|FAIL\b`, case-insensitive), and the last 10 lines of the failing step's output. This replaces piping `gh run view <databaseId> --log-failed` through ad-hoc `tail`/`head`/grep — the actual error is guaranteed to be in scope and ~3-5K tokens of unrelated log noise are skipped per investigation. If the output is empty (green-but-failed run, log unattached, API quirk), fall back to `gh run view <databaseId>` without `--log-failed` for the high-level summary.
-2. Diagnose root cause. Do NOT bypass the check.
-3. Fix; commit with a conventional-commit message referencing the failing check.
-4. `git pull --rebase` + `git push`.
-
-**Trap to avoid:** `gh run rerun --failed` re-uses the original event snapshot. If the failure was caused by an outdated PR body or a missing label, `--failed` will re-fail with the same stale context — even after you've edited the body or applied the label. After fixing a label or body issue, fire a fresh `synchronize` event by either pushing a new commit or running:
-
-  gh api --method PUT 'repos/{owner}/{repo}/pulls/<pr#>/update-branch'
-
-That merges the latest base into the PR branch and re-fires every workflow on the new HEAD SHA — picking up the current body and label state.
-
-**CodeQL stale aggregator pattern.** If `analyze (python|actions|...)` checks are all SUCCESS but the top-level `CodeQL` check is FAILURE, compare `completed_at` timestamps:
-
-- Aggregator completed *before* the analyzes → stale; it's reading old alert state. The next analyze cycle (or alert-resolution background job, ~5–10 min) will clear it. Don't dispatch an agent to investigate.
-- Aggregator completed *after* the analyzes → real alert. Investigate.
-
-The `gh api repos/.../code-scanning/alerts` endpoint requires `security_events` scope on the token; if you get 403, fall back to the Security tab in the GitHub UI or have the user dismiss the alert directly. If you hit this pattern often, consider running `gh auth refresh -s security_events` once at the orchestrator level so subsequent investigations can read the alert state via `gh api` directly.
-
-If the failure is environmental (infra outage, rate limit, unrelated to your diff): report it in the PR body and skip — do not retry blindly.
-
-#### 6.4 Set automerge — TERMINAL STEP
-
-**Precondition — run this probe before applying any merge-trigger:**
-
-    gh pr view <pr#> --json statusCheckRollup \
-      --jq '[.statusCheckRollup[] | select(.conclusion=="FAILURE")] | length'
-    # expected: 0
-
-If the probe returns >0, loop back to 6.3 — **do not set automerge**. Your prose recollection of "all checks passed" is not a substitute; the rollup is the source of truth, and the contract here fails open if you skip this. (Observed in the wild: an agent returned `AUTOMERGE_SET` while three checks were still in `conclusion: FAILURE`, because it trusted its own summary instead of re-querying the rollup.)
-
-*Known-environmental carve-out:* if every remaining failure is a documented infra/rate-limit issue per 6.3 (and noted in the PR body), you may proceed; otherwise the >0 result is blocking.
-
-**Do NOT remove the `in-progress` label when applying `automerge`.** The label persists from worktree-creation through merge — that's the audit trail of who handled the issue. The label only comes off on `BLOCKED` (replaced by `blocked`) or `PAUSED` (replaced by `paused`); otherwise the orchestrator (or GitHub's auto-close) handles cleanup after merge confirmation.
-
-Once review comments are addressed AND the probe above returns 0 (or only known-environmental failures remain), hand off to merge by reading the `Merge mechanism:` line from the "Current PR conventions (observed)" block above:
-
-- If `Merge mechanism: apply <label> label (merge-bot picks it up)` — apply the label and let the project's merge-bot drive the merge:
-
-      gh pr edit <pr#> --add-label <observed-label>
-
-- If `Merge mechanism: gh pr merge --auto --squash` (or the line is absent / unrecognised — default to native auto-merge):
-
-      gh pr merge <pr#> --auto --squash
-
-This is your last action. The merge happens asynchronously once all required checks pass (and, for the merge-bot path, once the bot picks up the label). **Return immediately** with one of:
-
-- `AUTOMERGE_SET <pr-url>` — merge handoff complete (label applied or `--auto` set), no findings outstanding, CI green or in flight. The orchestrator's Phase 5b shell monitor takes over from here (handles `BEHIND`, conflicts, CI failures, new review comments via focused mini-agents).
-- `MERGED <pr-url>` — the PR merged synchronously between you handing off and exiting (rare but possible — `gh pr merge --auto` may immediately complete the merge if all required checks were already green; merge-bot paths typically don't merge synchronously).
-
-If the native-auto-merge branch errors out (the repo doesn't have automerge enabled), fall back to `gh pr merge <pr#> --squash` (immediate squash-merge) and return `MERGED <pr-url>`. The label-triggered path has no equivalent fallback — if applying the label errors out, surface the error rather than guessing.
-
-**Do not poll for merge state. Do not narrate progress.** The whole point of returning here is to free your slot — narrating between polls is what Phase 5b is designed to eliminate.
-
-#### Worked example: review came back clean
-
-When the 6.1 subagent returns and the only output is `Claude Reviewer: LGTM`, the next tool calls in this turn should be (no narration to the orchestrator in between):
-
-```bash
-# 6.2 — confirm there are no inline findings to address.
-gh api 'repos/{owner}/{repo}/pulls/<pr#>/comments' --paginate \
-  --jq '[.[] | select(.body | startswith("Claude Reviewer: "))] | length'
-# expected: 0
-
-# 6.3 — confirm CI is green (or only environmental failures).
-gh pr view <pr#> --json statusCheckRollup \
-  --jq '[.statusCheckRollup[] | select(.conclusion=="FAILURE")] | length'
-# expected: 0 (or only known-environmental — see 6.3 for handling)
-
-# 6.4 precondition — re-run the failure-count probe immediately before the merge-trigger
-# (this is the hard gate from 6.4; the 6.3 run above is for diagnosis, this run is the contract):
-gh pr view <pr#> --json statusCheckRollup \
-  --jq '[.statusCheckRollup[] | select(.conclusion=="FAILURE")] | length'
-# expected: 0 — if >0, loop back to 6.3, do not proceed.
-
-# 6.4 — hand off to merge per the `Merge mechanism:` line in the observed-PR-conventions block.
-# If the line says `apply automerge label (merge-bot picks it up)`:
-gh pr edit <pr#> --add-label automerge
-# Otherwise (native auto-merge — the default):
-gh pr merge <pr#> --auto --squash
+```text
+READY_FOR_REVIEW https://github.com/o/r/pull/91
 ```
 
-Then return `AUTOMERGE_SET <pr-url>` as the structured output (or `MERGED <pr-url>` if the PR merged synchronously). Do not summarise the review back to the orchestrator; the LGTM comment is on the PR for the orchestrator's digest to pick up directly.
+Do not summarise what you implemented; the PR body already does that. Do not run a review subagent yourself — the orchestrator does that at its own level. Do not poll merge state — the orchestrator owns the merge pipeline from here.
 
-**You have only completed your task when you return `AUTOMERGE_SET`, `MERGED`, `BLOCKED`, `PAUSED`, or `ERRORED`. Returning the review subagent's findings is not a valid output. If the review is clean (only `Claude Reviewer: LGTM`), immediately set automerge and exit. Do not summarise the review back to the orchestrator. Do not poll for merge state — the orchestrator's Phase 5b shell monitor owns that.**
+**You have only completed your task when you return `READY_FOR_REVIEW`, `BLOCKED`, `PAUSED`, or `ERRORED`. Reporting "the PR is open and looks fine" is not a valid output. The token is the contract.**
 
 ## Blocker handling
 
@@ -719,26 +614,27 @@ The orchestrator can re-dispatch with a resumption prompt (Phase 5 step 0) once 
 
 Return EXACTLY ONE of these strings, ONCE, at the very end. Do not narrate progress — any non-structured text is interpreted by the orchestrator as a premature exit.
 
-- `AUTOMERGE_SET <pr-url>` — merge handoff complete (label applied or native automerge set per the `Merge mechanism:` observation), no findings outstanding, CI green or in flight. The orchestrator's Phase 5b shell monitor takes over and drives the PR to merge. **This is the default success exit.**
-- `MERGED <pr-url>` — PR has actually merged. Possible when automerge isn't enabled and you fell back to `gh pr merge --squash`, or when the PR merged synchronously between you handing off and exiting.
+- `READY_FOR_REVIEW <pr-url>` — PR is open, the diff has had a final self-review pass for code-quality, and you are handing the PR to the orchestrator for independent review → address-review → CI-fix → merge. **This is the default success exit.**
 - `BLOCKED <N> <question>` — parked on a public-break ambiguity awaiting clarification.
 - `PAUSED <N> <reason>` — environmentally paused (usage cap, infra outage). Orchestrator may re-dispatch when the condition clears.
 - `ERRORED <N> <error>` — non-recoverable failure.
+
+There is no `AUTOMERGE_SET` or `MERGED` token from the implementing agent — the orchestrator owns the merge handoff after the review and address-review phases complete. If you ever find yourself reaching for `gh pr merge` or `gh pr edit --add-label automerge`, stop: that's the orchestrator's job.
 
 ### Returning your terminal status
 
 The orchestrator parses **only** the `result` field of your final notification, and it parses by literal prefix match. Format discipline is load-bearing:
 
-- The `result` field of your final notification MUST start with one of the literal terminal tokens above (`AUTOMERGE_SET`, `MERGED`, `BLOCKED`, `PAUSED`, `ERRORED`) followed by the relevant args. No leading prose, no quoting, no markdown — the token is the first thing the orchestrator sees.
-- Heartbeat notifications during 6.1 → 6.4 (e.g. "ran review subagent", "addressed CI failure", "applied automerge label") are fine and encouraged — they let the user see progress. Only the *final* notification is the terminal handoff; only its `result` is parsed.
-- If you find yourself wanting to narrate ("the PR merged successfully, returning MERGED ..."), that's a heartbeat at best. The terminal contract is the literal token plus its args, nothing else. Freeform prose around the token breaks the orchestrator's parse — the orchestrator has a backstop that reconstructs PR state and routes to existing recovery paths (review subagent, review-comment mini-agent, CI-failure sizing, automerge handoff), but treat the backstop as a safety net for genuinely unexpected exits, not a license to be sloppy. The clean terminal token is still the contract; the backstop just keeps a malformed return from immediately surfacing to the user.
+- The `result` field of your final notification MUST start with one of the literal terminal tokens above (`READY_FOR_REVIEW`, `BLOCKED`, `PAUSED`, `ERRORED`) followed by the relevant args. No leading prose, no quoting, no markdown — the token is the first thing the orchestrator sees.
+- Heartbeat notifications during steps 1–6 (e.g. "ran tests", "pushed branch", "PR opened") are fine and encouraged — they let the user see progress. Only the *final* notification is the terminal handoff; only its `result` is parsed.
+- If you find yourself wanting to narrate ("the PR is open and looks ready for review, returning READY_FOR_REVIEW ..."), that's a heartbeat at best. The terminal contract is the literal token plus its args, nothing else. Freeform prose around the token breaks the orchestrator's parse — the orchestrator has a backstop that reconstructs PR state and routes to existing recovery paths (review dispatch, address-review dispatch, CI-failure sizing, automerge handoff), but treat the backstop as a safety net for genuinely unexpected exits, not a license to be sloppy. The clean terminal token is still the contract; the backstop just keeps a malformed return from immediately surfacing to the user.
 
-If you find yourself thinking "the review is done, I should report back" — don't. The review is the *start* of the merge loop, not the end. If you find yourself thinking "I should poll until the PR merges" — don't. Setting automerge is the end of your job; Phase 5b owns the rest.
+If you find yourself thinking "I should run a review subagent before exiting" — don't. The orchestrator dispatches the review subagent at its own level, exactly to avoid the recurring problem where the implementing agent's harness lacks `Task` / `general-purpose` access. If you find yourself thinking "I should poll until CI is green" — don't. Opening the PR and signalling `READY_FOR_REVIEW` is the end of your job; the orchestrator owns the rest.
 ```
 
 ## Phase 5b — Post-automerge monitoring
 
-Once an implementing agent returns `AUTOMERGE_SET <pr-url>`, the orchestrator owns the PR until merge. The goal is to spend as few tokens as possible on the wait-for-CI / wait-for-automerge tail without giving up the ability to recover from `BEHIND`, conflicts, CI failures, or new review comments.
+Once the orchestrator has set automerge (the LGTM or `READY_TO_MERGE` branch in Phase 5 step 5 ran the merge handoff per the observed `Merge mechanism:` line), it owns the PR until merge. The goal is to spend as few tokens as possible on the wait-for-CI / wait-for-automerge tail without giving up the ability to recover from `BEHIND`, conflicts, CI failures, or new review comments.
 
 ### Trade-off rationale (why a shell monitor + mini-agents, not a warm agent)
 
@@ -750,11 +646,14 @@ The other resilience win: a crashed monitor doesn't lose pipeline state — it j
 
 ### Handoff
 
-When step 5 of the Phase 5 execution loop receives `AUTOMERGE_SET <pr-url>` from a dispatched agent:
+When step 5 of the Phase 5 execution loop sets automerge (after `LGTM` from the review subagent or `READY_TO_MERGE` from the address-review mini-agent):
 
-1. Mark the issue as `automerge_set` in internal state (the slot is free; `in-flight` count drops).
-2. Launch the **shell monitor** (below) for that PR via the `Monitor` tool. The monitor's stdout is an event stream the orchestrator consumes.
-3. Continue the Phase 5 execution loop — pick up the next eligible issue.
+1. Run the merge handoff per the observed `Merge mechanism:` line:
+   - `gh pr edit <pr#> --add-label <observed-label>` for label-triggered merge-bots.
+   - `gh pr merge <pr#> --auto --squash` for the native-auto-merge default. If the repo doesn't have automerge enabled, fall back to `gh pr merge <pr#> --squash` (immediate squash-merge); the Phase 5b monitor will observe `MERGED` on the next poll.
+2. Mark the issue as `automerge_set` in internal state (used for digest tracking; the implementing-agent slot was already freed when `READY_FOR_REVIEW` was returned).
+3. Launch the **shell monitor** (below) for that PR via the `Monitor` tool. The monitor's stdout is an event stream the orchestrator consumes.
+4. Continue the Phase 5 execution loop — the slot is already free; pick up the next eligible issue if there is one.
 
 ### Shell monitor recipe
 
@@ -896,7 +795,7 @@ while :; do
   )
 
   # ---- STALLED_GREEN: CI green + automerge applied + open + mergeable. ----
-  # The PR is in the steady state that the AUTOMERGE_SET-stall remediation
+  # The PR is in the steady state that the automerge-stall remediation
   # ladder (tiers 2/3/4) is designed for: nothing is broken, but the merge
   # bot isn't firing. Emit once on first detection, then again at exponential
   # intervals (default 3 min / 9 min / 18 min) so the orchestrator can run
@@ -945,7 +844,7 @@ Key behaviours:
 - **Transient `gh` failures** (network blips, rate-limit retries) don't crash the loop — `|| true` and an empty-result check keep polling.
 - **Deduplication** — failing run IDs and review comment IDs are tracked, so a persistent failure escalates exactly once per ID, not on every tick.
 - **`Claude` -prefixed comments are skipped** so the monitor doesn't re-escalate on the implementing agent's or reviewer subagent's own comments.
-- **Stall detection collapses the latency tail.** When the PR sits in (`mergeable == MERGEABLE`, all checks `SUCCESS`/`SKIPPED`/`NEUTRAL`, `automerge` label present, `state == OPEN`) for longer than `STALL_THRESHOLD_SECONDS` (default 180), the monitor emits `STALLED_GREEN <pr#> green-for=<seconds>`. The orchestrator routes the first emit to tier 2 of the AUTOMERGE_SET-stall ladder immediately rather than waiting for its next progress-tick wakeup (which can be up to the current state-based interval away — see Phase 5 § Progress reporting § State-based wakeup interval). Re-emits use exponential backoff (1x / 3x / 6x of the threshold — default 3 / 9 / 18 minutes) so a persistent stall escalates through tier 3 and tier 4 without spamming the orchestrator on every poll, and any state change (new commit, label flip, check transition) resets the timer so transient stalls don't accumulate. The threshold is configurable via the `STALL_THRESHOLD_SECONDS` env var when launching the monitor.
+- **Stall detection collapses the latency tail.** When the PR sits in (`mergeable == MERGEABLE`, all checks `SUCCESS`/`SKIPPED`/`NEUTRAL`, `automerge` label present, `state == OPEN`) for longer than `STALL_THRESHOLD_SECONDS` (default 180), the monitor emits `STALLED_GREEN <pr#> green-for=<seconds>`. The orchestrator routes the first emit to tier 2 of the automerge-stall ladder immediately rather than waiting for its next progress-tick wakeup (which can be up to the current state-based interval away — see Phase 5 § Progress reporting § State-based wakeup interval). Re-emits use exponential backoff (1x / 3x / 6x of the threshold — default 3 / 9 / 18 minutes) so a persistent stall escalates through tier 3 and tier 4 without spamming the orchestrator on every poll, and any state change (new commit, label flip, check transition) resets the timer so transient stalls don't accumulate. The threshold is configurable via the `STALL_THRESHOLD_SECONDS` env var when launching the monitor.
 
 > **Related, out of scope:** cloning the PR branch via SSH (`gh config set git_protocol ssh`) would sidestep PAT-scope issues for repo writes — SSH key auth doesn't enforce the `workflow` scope. Tracked as a separate consideration; the visibility fix above is the more general improvement, since silent push failures bite in lots of ways beyond the one scope issue.
 
@@ -962,30 +861,30 @@ The `Monitor` tool surfaces each stdout line of `monitor-pr.sh` as a notificatio
 | `CONFLICT <pr#> <branch> <base> <files>` | Dispatch the **conflict-resolution mini-agent** (template below). |
 | `CI_FAILURE <pr#> <check> <run-id>` | Size the fix first (see **CI-failure sizing rule** below). If ≤50 lines / 1-2 files, fix in-place at the orchestrator level. Otherwise dispatch the **CI-failure-fix mini-agent** (template below). |
 | `NEW_COMMENT <pr#> <comment-id>` | Dispatch the **review-comment mini-agent** (template below). |
-| `STALLED_GREEN <pr#> green-for=<s>` | Run the **AUTOMERGE_SET stall** ladder *now* rather than waiting for the next progress-tick wakeup. **First** `STALLED_GREEN` for a given PR → apply tier 2 immediately (toggle the merge-trigger label). **Second** `STALLED_GREEN` for the same PR (the monitor's exponential-backoff re-emit means tier 2 didn't take) → escalate to tier 3 (`workflow_dispatch` break-glass on the merge workflow). **Third** and beyond → tier 4 (probe the merge bot's run log) and surface the finding to the user. The shell monitor handles tier 1 (`BEHIND` auto-resolve) before this event ever fires, so a `STALLED_GREEN` always means the bot is the problem, not a stale base. See **Tiered remediation when AUTOMERGE_SET stalls** below for the per-tier mechanics. |
+| `STALLED_GREEN <pr#> green-for=<s>` | Run the **automerge-stall** ladder *now* rather than waiting for the next progress-tick wakeup. **First** `STALLED_GREEN` for a given PR → apply tier 2 immediately (toggle the merge-trigger label). **Second** `STALLED_GREEN` for the same PR (the monitor's exponential-backoff re-emit means tier 2 didn't take) → escalate to tier 3 (`workflow_dispatch` break-glass on the merge workflow). **Third** and beyond → tier 4 (probe the merge bot's run log) and surface the finding to the user. The shell monitor handles tier 1 (`BEHIND` auto-resolve) before this event ever fires, so a `STALLED_GREEN` always means the bot is the problem, not a stale base. See **Tiered remediation when automerge stalls** below for the per-tier mechanics. |
 
 #### CI-failure stale-aggregator short-circuit
 
-Before dispatching the CI-failure-fix mini-agent, check the stale-aggregator pattern (see 6.3). If the failing check is `CodeQL` and the `analyze (...)` sub-jobs are SUCCESS, compare `completed_at` timestamps. Aggregator before analyzes = stale, will self-clear in ~5–10 min on the next analyze cycle or alert-resolution background job — don't dispatch. Let the shell monitor keep polling; the next `gh pr view` tick will observe the cleared rollup. Aggregator after analyzes = real alert, fall through to the sizing rule below.
+Before dispatching the CI-failure-fix mini-agent, check the stale-aggregator pattern (CodeQL stale aggregator — same logic the CI-failure-fix mini-agent template documents below). If the failing check is `CodeQL` and the `analyze (...)` sub-jobs are SUCCESS, compare `completed_at` timestamps. Aggregator before analyzes = stale, will self-clear in ~5–10 min on the next analyze cycle or alert-resolution background job — don't dispatch. Let the shell monitor keep polling; the next `gh pr view` tick will observe the cleared rollup. Aggregator after analyzes = real alert, fall through to the sizing rule below.
 
 The `gh api repos/.../code-scanning/alerts` endpoint requires `security_events` scope on the orchestrator's token; a 403 here means fall back to the Security tab in the GitHub UI (or `gh auth refresh -s security_events` if this pattern recurs).
 
 #### CI-failure sizing rule
 
-On a `CI_FAILURE` event during the wait-for-merge tail, investigate before dispatching: `bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/triage-ci-failure.sh" <repo> <run-id>` (focused ~30-line summary — see Phase 5 § 6.3 for the contract), find root cause, don't bypass. Then size the fix:
+On a `CI_FAILURE` event during the wait-for-merge tail, investigate before dispatching: `bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/triage-ci-failure.sh" <repo> <run-id>` (focused ~30-line summary — see the **CI-failure-fix mini-agent** template below for the script's contract), find root cause, don't bypass. Then size the fix:
 
 - **≤50-line fix in 1-2 files** (typecheck error, lint violation, missing import, sub-block in same file): **fix in place at the orchestrator level.** Do not pay the mini-agent cold-load. Use the existing branch — the implementing agent's worktree may still exist on disk at `.claude/worktrees/agent-<id>` and is reusable; otherwise check out the branch into a fresh worktree. Commit, push, let CI re-fire. The implementing agent is gone but the branch and PR are still yours.
 - **Larger fix, multi-file refactor, or new test surface required**: dispatch the CI-failure-fix mini-agent (template below). Pays a cold-load but safer for non-trivial changes.
 
-Either way, the implementing agent's terminal `AUTOMERGE_SET` return is final — don't try to "wake it up." The slot stays free for new issues.
+Either way, the implementing agent's terminal `READY_FOR_REVIEW` return is final — don't try to "wake it up." The slot was freed when it returned and the orchestrator's review / address-review / merge-handoff phases own everything from here.
 
 Mini-agents run in their own isolated worktrees with `run_in_background: true`. They do **not** count against the implementing-agent concurrency cap of 3 — they're focused, short-lived, and are part of a PR that has already cleared the implementing-agent slot. (Cap them informally if you observe contention; defer formal limits until needed.)
 
-When a dispatched mini-agent returns `RESOLVED` / `FIXED` / `ADDRESSED`, the shell monitor — still polling — will eventually observe the underlying state has cleared (conflict gone, CI green, comment threaded) and stop emitting that event. If a mini-agent returns `BLOCKED <question>` or `ENVIRONMENTAL <reason>`, the orchestrator surfaces it to the user and may stop the monitor (treat the PR as parked, just like a `BLOCKED` from the implementing agent).
+When a dispatched mini-agent returns `RESOLVED` / `FIXED` / `ADDRESSED` / `READY_TO_MERGE`, the shell monitor — still polling — will eventually observe the underlying state has cleared (conflict gone, CI green, comment threaded) and stop emitting that event. The `READY_TO_MERGE` return from the address-review mini-agent additionally tells the orchestrator to set automerge (per the observed `Merge mechanism:` line) before Phase 5b's monitor can drive the PR to merge — see Phase 5 step 5's `READY_TO_MERGE` branch. If a mini-agent returns `BLOCKED <question>` or `ENVIRONMENTAL <reason>`, the orchestrator surfaces it to the user and may stop the monitor (treat the PR as parked, just like a `BLOCKED` from the implementing agent).
 
-### Tiered remediation when AUTOMERGE_SET stalls
+### Tiered remediation when automerge stalls
 
-When a PR sits in `AUTOMERGE_SET` longer than ~5 minutes after CI rollup is fully green and the shell monitor's `green + waiting` no-op state has persisted, the merge bot has likely failed to fire (or fired and exited cleanly waiting for a re-trigger that never came). Work through these tiers **in order — don't loop on the early ones**. If a tier fails twice, escalate to the next; don't retry the same tier indefinitely.
+When a PR sits in the orchestrator's internal `automerge_set` state longer than ~5 minutes after CI rollup is fully green and the shell monitor's `green + waiting` no-op state has persisted, the merge bot has likely failed to fire (or fired and exited cleanly waiting for a re-trigger that never came). Work through these tiers **in order — don't loop on the early ones**. If a tier fails twice, escalate to the next; don't retry the same tier indefinitely.
 
 The trigger for entering this ladder is the shell monitor's `STALLED_GREEN <pr#> green-for=<s>` event (see the orchestrator event-routing table above) — the monitor emits it on the first poll where the steady state has held past `STALL_THRESHOLD_SECONDS` (default 180s) and re-emits at exponentially-spaced intervals while the stall persists. Each successive `STALLED_GREEN` for the same PR maps to the next tier in this list: first emit → tier 2, second → tier 3, third and beyond → tier 4. Don't wait for the next progress-tick wakeup to start tier 2 once a `STALLED_GREEN` arrives; the whole point of the event is to collapse that latency.
 
@@ -1011,7 +910,36 @@ The trigger for entering this ladder is the shell monitor's `STALLED_GREEN <pr#>
 
 ### Mini-agent dispatch templates
 
-These are intentionally tighter than the main dispatch template — no full pipeline scaffolding, no plan step, no review subagent. Each is a focused prompt for a single narrow job. Project conventions are still consulted (the agent reads `CLAUDE.md` if it has to commit), but the prompt does not re-embed them in full.
+These are intentionally tighter than the main dispatch template — no full pipeline scaffolding, no plan step, no spawn-another-subagent step. Each is a focused prompt for a single narrow job. Project conventions are still consulted (the agent reads `CLAUDE.md` if it has to commit), but the prompt does not re-embed them in full.
+
+#### Review subagent (orchestrator-level)
+
+Dispatched on `READY_FOR_REVIEW` (Phase 5 step 5) and on the reconstruction probe's "review never ran" branch. Runs at the orchestrator's level so it always has `general-purpose` / `Task` access — that's the whole reason this dispatch lives on the orchestrator, not the implementing agent. Use `subagent_type: "general-purpose"`, `run_in_background: false`:
+
+```
+You are reviewing PR #<pr#> on <repo>. Fetch the diff with `gh pr diff <pr#>`. Review it against the project's conventions documented in `CLAUDE.md`, `.claude/instructions/*.md`, and `CONTRIBUTING.md`. Look for: scope creep, undocumented decisions, missing tests, dead code, unclear naming, breaking changes that aren't called out, security issues, and convention violations.
+
+Post each finding as an inline comment via the GitHub API:
+
+  gh api --method POST 'repos/{owner}/{repo}/pulls/{pr#}/comments' \
+    -f body='Claude Reviewer: <finding>' \
+    -f commit_id='<head sha>' \
+    -f path='<file>' \
+    -f line=<line>
+
+Use the `Claude Reviewer: ` prefix on every comment. If the diff is clean (no findings), post a single PR comment via `gh pr comment <pr#> --body 'Claude Reviewer: LGTM. <one-line summary of what you checked>'` and return.
+
+Return EXACTLY ONE of:
+- `LGTM <pr-url>` — diff is clean; the single `Claude Reviewer: LGTM` PR comment is posted.
+- `FINDINGS <pr-url> <count>` — `<count>` inline `Claude Reviewer:` comments posted.
+- `ERRORED <reason>` — non-recoverable.
+```
+
+The orchestrator routes the return:
+
+- `LGTM` → set automerge per the observed `Merge mechanism:` line; hand off to Phase 5b.
+- `FINDINGS` → dispatch the **address-review mini-agent** (below) on the implementing agent's branch.
+- `ERRORED` → surface to user, park the PR.
 
 #### Conflict-resolution mini-agent
 
@@ -1074,6 +1002,8 @@ Return EXACTLY ONE of:
 
 #### Review-comment mini-agent
 
+Dispatched by the Phase 5b shell monitor's `NEW_COMMENT` event — i.e. a *single* review comment landed mid-pipeline (typically a human reviewer comment after the orchestrator-level review pass). For the bulk-address pass right after the orchestrator-level review subagent posts its findings, dispatch the **address-review mini-agent** below instead — it's the same kind of work but batched, and it returns the `READY_TO_MERGE` token the orchestrator's state machine expects.
+
 ```
 You are addressing a review comment on PR #<pr#> in <repo>. Comment ID: <comment-id>.
 
@@ -1101,9 +1031,55 @@ Return EXACTLY ONE of:
 - `ERRORED <reason>` — non-recoverable.
 ```
 
+#### Address-review mini-agent
+
+Dispatched on the `FINDINGS` return from the orchestrator-level review subagent (Phase 5 step 5, "≥1 finding" branch). Bulk-addresses every unaddressed `Claude Reviewer:` comment posted by the review subagent, then signals back so the orchestrator can set automerge.
+
+```
+You are addressing review findings on PR #<pr#> in <repo>. Branch: `<branch>`.
+
+You run in an isolated worktree (`isolation: worktree`). Check out the PR branch:
+
+  gh pr checkout <pr#>
+
+Pipeline:
+
+1. Fetch unaddressed inline comments:
+
+     gh api 'repos/{owner}/{repo}/pulls/<pr#>/comments' --paginate
+
+   A comment is *unaddressed* when `in_reply_to_id == null` (top-level reviewer comment) AND no other comment's `in_reply_to_id` equals its `id`. Filter to those with body starting `Claude Reviewer: ` (the review subagent's prefix).
+
+2. For each unaddressed `Claude Reviewer:` comment:
+
+   a. Make the code change, OR document why the suggestion shouldn't be adopted.
+   b. Commit with a conventional-commits message describing the change. One commit per finding is fine; squashing related findings into one commit is fine too — use judgment.
+   c. Post a threaded reply:
+
+        gh api --method POST 'repos/{owner}/{repo}/pulls/<pr#>/comments/<id>/replies' \
+          -f body='Claude: Done!'
+
+      If the suggestion was adopted as-is, use `Claude: Done!`. If you took a different approach, use `Claude: <one-line explanation>`.
+
+3. After all findings are addressed: `git pull --rebase origin <branch>` then `git push`. Retry up to 3x on non-fast-forward.
+
+4. Also check issue-level PR comments:
+
+     gh api 'repos/{owner}/{repo}/issues/<pr#>/comments' --paginate
+
+   Issue-level comments don't have thread replies — reply with a new issue comment prefixed `Claude: `. Skip the single `Claude Reviewer: LGTM` comment if present (no findings there to address).
+
+Do NOT set automerge. Do NOT run `gh pr merge`. Do NOT apply a merge-trigger label. The orchestrator owns the merge handoff after you return — that's the whole point of the `READY_TO_MERGE` signal.
+
+Return EXACTLY ONE of:
+- `READY_TO_MERGE <pr-url>` — every `Claude Reviewer:` finding has been addressed, the branch is pushed, and the threads are replied to.
+- `BLOCKED <question>` — at least one finding requires a public-break decision (e.g. competing API shapes). Comment on the PR with `Claude: Blocked — <question>` first.
+- `ERRORED <reason>` — non-recoverable.
+```
+
 ## Phase 6 — Post-completion housekeeping
 
-When the orchestrator observes a `MERGED` event — either from an implementing agent's terminal `MERGED <pr-url>` return (synchronous merge case) or from the Phase 5b shell monitor's `MERGED <pr-url>` event (the `AUTOMERGE_SET → MERGED` handoff):
+When the orchestrator observes a `MERGED` event from the Phase 5b shell monitor (the `automerge_set → MERGED` handoff after the orchestrator-level merge handoff completes):
 
 1. **Flip the task to `completed` — as a standalone tool call, not bundled with any other tool call.**
 
@@ -1172,7 +1148,7 @@ The orchestrator's `TaskList` is the canonical state surface — every in-scope 
 
 ### Phase 8.0 — TaskList ↔ GitHub reconciliation (defensive backstop)
 
-Before emitting the final report, walk every in-scope issue (the list resolved in Phase 1) and reconcile the local `TaskList` against GitHub's view. This is a **backstop**, not the primary fix — the source-fix is the standalone `TaskUpdate` rule in Phase 6 step 3 (and Phase 5 steps 2–3) that prevents drift from arising in the first place. Phase 8.0 catches whatever slips through: harness cancellations on bundled tool-call groups, transient `gh` failures that wedged a state transition, manual close+reopen races, etc.
+Before emitting the final report, walk every in-scope issue (the list resolved in Phase 1) and reconcile the local `TaskList` against GitHub's view. This is a **backstop**, not the primary fix — the source-fix is the standalone `TaskUpdate` rule in Phase 6 step 1 (and Phase 5 steps 2–3) that prevents drift from arising in the first place. Phase 8.0 catches whatever slips through: harness cancellations on bundled tool-call groups, transient `gh` failures that wedged a state transition, manual close+reopen races, etc.
 
 For each in-scope issue `<n>`:
 
@@ -1213,7 +1189,7 @@ In each case: leave labels as-is, surface immediately to user, do not proceed.
 **Recoverable** environmental conditions are NOT bail-outs:
 
 - **Usage-cap exhaustion**: agent returns `PAUSED`. Orchestrator records the reset time and re-dispatches a resumption agent (Phase 5 step 0 path) once the cap clears.
-- **Transient CI infra blips** (one-off rate limits, single workflow timeout): agent investigates per step 8 and pushes a fix or surfaces to the user; this is not a run-wide halt.
+- **Transient CI infra blips** (one-off rate limits, single workflow timeout): the orchestrator's CI-failure-fix path (Phase 5b — either in-place ≤50-line fix or the CI-failure-fix mini-agent) investigates and either pushes a fix or returns `ENVIRONMENTAL` for the orchestrator to surface; this is not a run-wide halt.
 
 ## State persistence
 
@@ -1221,9 +1197,11 @@ For runs that may span context windows, persist minimal state at `.claude/workfl
 
 ```json
 {
-  "in_scope": [280, 281, 282, 283, 284],
+  "in_scope": [280, 281, 282, 283, 284, 285, 286],
   "merged": [280],
   "automerge_set": {"281": "https://github.com/o/r/pull/91"},
+  "reviewing": {"285": "https://github.com/o/r/pull/95"},
+  "addressing": {"286": "https://github.com/o/r/pull/96"},
   "in_progress": [282],
   "blocked": {"283": "needs schema decision"},
   "paused": {"284": "usage cap until 2026-04-25T10:10Z"},
@@ -1231,7 +1209,7 @@ For runs that may span context windows, persist minimal state at `.claude/workfl
 }
 ```
 
-The `automerge_set` map tracks PRs handed off to Phase 5b's shell monitor; entries clear when the monitor emits `MERGED`.
+The `reviewing` map tracks PRs in the orchestrator's review-subagent dispatch (after `READY_FOR_REVIEW`, before LGTM/FINDINGS lands). The `addressing` map tracks PRs in the address-review mini-agent dispatch (after `FINDINGS`, before `READY_TO_MERGE` lands). The `automerge_set` map tracks PRs handed off to Phase 5b's shell monitor; entries clear when the monitor emits `MERGED`.
 
 Read on start (if present, resume); write on every label change. Delete on Phase 8 completion.
 
@@ -1250,6 +1228,7 @@ This skill is gh-specific. To extend to another tracker (Linear, Jira, etc.) the
 | Hand off to merge | `gh pr merge <n> --auto --squash` (native) or `gh pr edit <n> --add-label <bot-label>` (label-triggered merge-bot — see Phase 1.5 detection) |
 | Check CI | `gh pr checks <n>` / `gh pr view --json statusCheckRollup` |
 | List PR review comments | `gh api repos/.../pulls/<n>/comments` |
+| Post inline review comment (orchestrator-level review subagent) | `gh api --method POST repos/.../pulls/<n>/comments` (with `body=Claude Reviewer: ...`, `commit_id`, `path`, `line`) |
 | Reply to review comment | `gh api --method POST repos/.../pulls/<n>/comments/<id>/replies` |
 
 When extending: copy this skill, swap the operations table for the new tracker, document the equivalent label semantics. Don't abstract into a runtime adapter until at least two trackers actually need it.
