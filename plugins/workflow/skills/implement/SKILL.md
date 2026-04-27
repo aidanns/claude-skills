@@ -553,7 +553,7 @@ The 270s default is calibrated to the prompt-cache TTL (~5 min): it's the longes
 | Any PR in tiered-remediation flow after a `STALLED_GREEN` emit (tier 2/3/4 in-flight)        | **60s**       | A label-flip or `workflow_dispatch` break-glass should produce a near-term state change; fast follow-up confirms it took.            |
 | Any PR in `automerge_set` with CI still in progress (any check `IN_PROGRESS`/`QUEUED`)       | **270s**      | CI runs take 5–10 min; 270s is the cache-TTL-aligned default and there's nothing to gain from polling faster.                        |
 | Only implementing agents in flight (no PRs in `automerge_set` yet)                            | **600s**      | The orchestrator gets notified directly on agent termination; per-tick polling adds no value, so widen the interval and accept a cache miss. |
-| Run drained (in-flight count == 0) but parked questions outstanding awaiting user input      | **none**      | Skip the `ScheduleWakeup` call entirely. The orchestrator awaits the user's reply; nothing else will change state.                   |
+| Run drained (in-flight count == 0) but parked questions outstanding awaiting user input      | **3600s**     | Long-interval fallback so the orchestrator notices out-of-band changes to a parked issue (label removed, body edited, issue closed externally) without requiring the user to re-invoke the skill. Each tick runs the parked-issue poll (see § Parked-issue poll below). The user can opt out with "stop polling, I'll re-invoke explicitly when ready" — the orchestrator then skips the `ScheduleWakeup` call entirely and reverts to the original "no wakeup" behaviour. |
 | Default (mixed in-flight, none of the above special cases)                                    | **270s**      | Cache-TTL-aligned baseline.                                                                                                          |
 
 **Examples — predicting the cadence from a run shape:**
@@ -562,8 +562,36 @@ The 270s default is calibrated to the prompt-cache TTL (~5 min): it's the longes
 - One PR in `automerge_set` with `STALLED_GREEN` having fired and tier 2 (label-flip) just dispatched → **60s**. The next tick checks whether the label-flip nudged the bot into firing.
 - Two PRs in `automerge_set`, one with CI green and one with CI in progress → **90s** (the green-and-merge-pending row matches first; the in-progress PR will be re-checked on the same tick).
 - Three implementing agents in flight, no PRs opened yet → **600s**. The orchestrator wakes on each agent's terminal return; polling at 270s would just re-emit `#<N>: implementing` lines until the first PR appears.
-- Run drained (last PR merged) but two issues parked on user-input questions → **no wakeup**. The orchestrator awaits the user's reply; the next event is a user message, not a tick.
+- Run drained (last PR merged) but two issues parked on user-input questions → **3600s**. Each tick polls each parked issue's `state`/`body`/`labels` (see § Parked-issue poll below); a label flip, body edit, or external close re-enters Phase 5 for the affected issue.
+- Same run shape as above but the user explicitly said "stop polling, I'll re-invoke explicitly when ready" → **no wakeup**. The orchestrator skips `ScheduleWakeup` and awaits a user message; the parked-issue poll does not run.
 - Mixed run: one implementing agent + one PR in `automerge_set` with CI in progress → **270s** (the in-progress-CI row matches before the agents-only row).
+
+**Parked-issue poll:**
+
+When the all-parked row matches and the user has not opted out of polling, the 3600s wakeup tick runs a lightweight check against each parked issue's GitHub state. Without it, an orchestrator that drained to all-parked is dead-on-arrival: someone (or another tool) editing the issue body, removing the `blocked` label, or closing the issue externally would never reach the run, and the user would have to remember to `--resume <id>` themselves.
+
+What it queries — for each issue in `state == "blocked"`:
+
+```bash
+gh issue view <N> --json state,body,labels
+```
+
+What counts as "changed" (any one of the following, compared against the snapshot taken when the issue was parked):
+
+- **Label removed** — the `blocked` label (or any label the user said they would flip to unblock) is no longer present. The user effectively answered the parked question by removing the gate.
+- **Body updated** — the issue body differs from the snapshot. The user or another tool answered the parked question by editing the body in place (the most common pattern when `/refine-issues` records a clarification).
+- **State == CLOSED** — the issue was closed externally (e.g. as a duplicate or no-repro). The clarification will never come; the run should not sit parked forever.
+
+Action on change:
+
+- **Label removed or body updated** → re-enter Phase 5 with the affected issue: clear the `blocked` label if still present, flip per-issue state from `blocked` back to `scheduled`, and let the next tick pick it up via the normal Phase 5 dispatch path. Surface a chat line summarising what changed ("`#<N>: blocked label removed externally — resuming`" / "`#<N>: body edited externally — resuming`").
+- **State == CLOSED** → treat as MERGED-equivalent for state-machine purposes: flip per-issue state from `blocked` to a terminal "externally closed" outcome, drop it from the in-flight set, and surface to the user (`#<N>: closed externally — not re-dispatched`). Do **not** open a PR or re-dispatch — the issue is gone, and re-entering Phase 5 against a closed issue would either fail or produce orphan work.
+
+Refresh the snapshot used for next-tick comparison after every poll so a quiescent issue keeps producing "no change" without re-firing on prior diffs.
+
+Cost note: one `gh issue view` per parked issue per hour is negligible — the all-parked branch is already low-frequency, and a typical run parks 1–3 issues at most. The poll is bounded above by the 3600s cadence and below by the size of the parked set.
+
+Opt-out: when the user says something like "stop polling, I'll re-invoke explicitly when ready," skip `ScheduleWakeup` for the all-parked row entirely (revert to the old `none` behaviour). The opt-out is per-run and is forgotten on `--resume`; the user can re-state it on resume if they still want it.
 
 **Per-issue probe** — for each in-flight issue `<N>`, invoke the digest-line script and emit its stdout verbatim, then append it to the session state file's `digest_tail`:
 
