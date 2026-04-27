@@ -895,11 +895,12 @@ while :; do
   )
 
   # ---- STALLED_GREEN: CI green + automerge applied + open + mergeable. ----
-  # The PR is in the steady state Tier 2/3/4 of the AUTOMERGE_SET-stall
-  # remediation ladder is designed for: nothing is broken, but the merge bot
-  # isn't firing. Emit once on first detection, then again at exponential
-  # intervals (3 min / 9 min / 18 min) so the orchestrator can run tier 2
-  # immediately and escalate to tier 3 / tier 4 only if the stall persists.
+  # The PR is in the steady state that the AUTOMERGE_SET-stall remediation
+  # ladder (tiers 2/3/4) is designed for: nothing is broken, but the merge
+  # bot isn't firing. Emit once on first detection, then again at exponential
+  # intervals (default 3 min / 9 min / 18 min) so the orchestrator can run
+  # tier 2 immediately and escalate to tier 3 / tier 4 only if the stall
+  # persists.
   # Treat pending checks (null conclusion / IN_PROGRESS / QUEUED status) as
   # NOT green — STALLED_GREEN is for "the rollup is fully resolved and the
   # bot still isn't merging", not for "checks are still running".
