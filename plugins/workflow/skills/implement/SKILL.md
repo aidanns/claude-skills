@@ -82,6 +82,8 @@ If a label doesn't exist in the repo, create it once via `gh label create` (see 
 
 **Trigger-surface widening triggers retroactive CodeQL findings.** If your PR adds `workflow_run` or `pull_request_target` as a trigger to any workflow file, audit *every* `run:` block in that file for inline `${{ steps.* }}`, `${{ github.event.* }}`, or `${{ inputs.* }}` interpolations. CodeQL will treat values flowing from the new trigger as untrusted, and existing safe-looking interpolations become `js/actions/command-injection` findings. Convert affected interpolations to the `env:` block + `${VAR}` shell expansion pattern that the rest of the file likely already uses. Run the local CodeQL action if available, or expect a CI failure on first push.
 
+**CWD discipline — prefer absolute paths and `--repo <owner>/<repo>` over CWD-derived defaults.** A stranded CWD (the bash session sitting in a directory that has been moved or deleted) is a classic source of opaque `git`/`gh` errors — typically `git: fatal: unknown error occurred while reading the configuration files` or similar. The Phase 6 worktree removal is the most common trigger (the orchestrator may have `cd`'d into the worktree earlier to push an empty commit, manually resolve `BEHIND`, or check git state, and the cleanup then deletes that directory under it), but anything that moves or removes a directory the bash session is sitting in produces the same failure mode. Two-pronged defence: (a) Phase 6 step 3 ends with a `cd` back to the repo root so the next command lands in a known-good CWD, and (b) the orchestrator should otherwise prefer absolute paths and explicit `--repo <owner>/<repo>` flags on `gh` calls — and `git -C <abs-path>` for `git` — rather than relying on CWD-derived defaults, so a stranded CWD degrades gracefully instead of producing cryptic errors.
+
 ## Phase 1 — Intake
 
 Resolve the issue list:
@@ -1031,7 +1033,7 @@ When the orchestrator observes a `MERGED` event — either from an implementing 
 
    GitHub's auto-close-on-`Closes #N` is unreliable for App-token-mediated API merges (observed in repos using a merge-bot pattern with bypass-actor App tokens). Don't wait for it; verify and close yourself.
 
-3. **Remove the worktree** at the path returned in the agent's notification. The existing `/close-worktree` skill encapsulates this — `cd` out of the worktree, `git worktree remove --force <path>`, then `git worktree prune`. Reuse that skill rather than re-deriving the steps. This step is required: `isolation: worktree` only auto-cleans when the agent made no changes, and a successful run always makes changes — so without explicit removal, every merged PR leaves a locked worktree under `.claude/worktrees/agent-<id>/` that grows disk and inode cost monotonically.
+3. **Remove the worktree** at the path returned in the agent's notification. The existing `/close-worktree` skill encapsulates this — `cd` out of the worktree, `git worktree remove --force <path>`, then `git worktree prune`, then `cd` back to the repo root. Reuse that skill rather than re-deriving the steps. This step is required: `isolation: worktree` only auto-cleans when the agent made no changes, and a successful run always makes changes — so without explicit removal, every merged PR leaves a locked worktree under `.claude/worktrees/agent-<id>/` that grows disk and inode cost monotonically. The trailing `cd` back to the repo root is required for a different reason: if the orchestrator's bash session ever `cd`'d into the removed worktree earlier in the run (e.g. to push an empty commit, manually resolve `BEHIND`, or check git state), its CWD is now dangling and subsequent `git`/`gh` calls in that session fail with cryptic config-read errors.
 
 4. **Pick up the next eligible issue.** The `in-progress` label persists on the closed issue (intentional — preserves audit trail).
 
@@ -1050,6 +1052,7 @@ gh issue view 281 --json state
 gh issue close 281 --comment "..."        # only if step 2 found it OPEN
 git worktree remove --force <worktree-path>
 git worktree prune
+cd <repo-root>                             # land in a known-good CWD post-removal
 git pull origin main                       # in the orchestrator's checkout
 ```
 
