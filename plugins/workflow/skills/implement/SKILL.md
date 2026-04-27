@@ -125,14 +125,14 @@ Two paths, mutually exclusive:
   1. For each issue with `state == "blocked"`, re-fetch the issue body fresh (`gh issue view <n> --json body --jq .body`) — the user may have edited it out-of-band while the session was gone. Read the latest `Claude: Blocked — <question>` comment via `gh issue view <n> --comments` (or `gh api repos/:owner/:repo/issues/<n>/comments` if a tighter probe is needed) and prefer that as the canonical question text; fall back to the state file's `blocked_question` only if the comment is missing (e.g. the user deleted it).
   2. Compile the resumed-`blocked` questions into the same single batched message Phase 2 already uses — numbered, grouped by issue — alongside any other resumed-blocked issues in the run. Surface to the user. Wait for answers.
   3. After answers, apply each answer via `gh issue edit <n> --body "<updated>"` (so a future dispatch reads the resolved context from the issue body, not from chat history) and remove the `blocked` label.
-  4. **Flip the per-issue state in the session state file from `blocked` back to `scheduled`** so Phase 5 dispatch picks the issue up on the next loop tick:
+  4. **Flip the per-issue state in the session state file from `blocked` back to `scheduled`** so Phase 5 dispatch picks the issue up on the next loop tick — and clear the now-stale `blocked_question` field on the same call so a future progress digest, `--session list`, or any downstream state-file reader doesn't surface a question that has already been answered:
 
      ```bash
      bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" update-issue \
-       "$session_id" <n> scheduled
+       "$session_id" <n> scheduled blocked_question=
      ```
 
-     The `update-issue` allow-list already permits the `blocked → scheduled` transition; no schema change is needed.
+     The `update-issue` allow-list already permits the `blocked → scheduled` transition and accepts an empty string for `blocked_question` (the helper's allow-list at `scripts/session-state.sh` only validates string values, so an empty string is the canonical "cleared" representation — there is no `null` passthrough). No schema change is needed.
 
   Worked example. State file says `#412` is `blocked` with `blocked_question: "Should the new export use kebab-case or snake_case for the env var name?"`. On `--resume`:
 
@@ -152,10 +152,13 @@ Two paths, mutually exclusive:
   gh issue edit 412 --body "<existing body + 'Decision: env var name uses kebab-case (CLAUDE_FOO_BAR).'>"
   gh issue edit 412 --remove-label blocked
 
-  # 4. Flip the session state from blocked → scheduled so Phase 5 picks it up.
+  # 4. Flip the session state from blocked → scheduled so Phase 5 picks it up,
+  #    and clear the parked-question field on the same call.
   bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" update-issue \
-    "$session_id" 412 scheduled
+    "$session_id" 412 scheduled blocked_question=
   ```
+
+  **Ordering — selective Phase 2 runs *before* Phase 4 re-entry.** Run the selective re-Phase-2 above to completion (questions surfaced, answers applied, `blocked → scheduled` flips written) *before* the Phase 4 re-entry pass at line 121, not after. Phase 4 attaches the `scheduled` label and creates a TaskList task for every issue whose persisted state is `scheduled` or `in-progress` at the time it runs; an issue freshly flipped from `blocked → scheduled` only picks up its label and TaskList row if Phase 4 sees it as `scheduled` — i.e. after the flip. If Phase 4 ran first, newly-unblocked issues would slip straight to Phase 5 dispatch with no TaskList task tracking them.
 
   Phase 5 then dispatches `#412` on its next loop tick exactly as it would for any freshly-scheduled issue. (The `Closes #N` PR will reach merge through the normal pipeline; nothing about the resumed-from-`blocked` path differs after this point.)
 
@@ -643,7 +646,7 @@ What counts as "changed" (any one of the following, compared against the snapsho
 
 Action on change:
 
-- **Label removed or body updated** → re-enter Phase 5 with the affected issue: clear the `blocked` label if still present, flip per-issue state from `blocked` back to `scheduled` (`update-issue <id> <n> scheduled` — the `blocked_question` / `body_snapshot` / `labels_snapshot` fields stay in the file but are ignored once `state != "blocked"`), and let the next tick pick it up via the normal Phase 5 dispatch path. Surface a chat line summarising what changed ("`#<N>: blocked label removed externally — resuming`" / "`#<N>: body edited externally — resuming`").
+- **Label removed or body updated** → re-enter Phase 5 with the affected issue: clear the `blocked` label if still present, flip per-issue state from `blocked` back to `scheduled` and clear `blocked_question` on the same call (`update-issue <id> <n> scheduled blocked_question=`) so progress digests / `--session list` don't keep surfacing an already-answered question. The `body_snapshot` / `labels_snapshot` fields stay in the file but are ignored once `state != "blocked"` (the next BLOCKED transition, if any, will overwrite them). Then let the next tick pick the issue up via the normal Phase 5 dispatch path. Surface a chat line summarising what changed ("`#<N>: blocked label removed externally — resuming`" / "`#<N>: body edited externally — resuming`").
 - **State == CLOSED** → flip per-issue state from `blocked` to the terminal `externally_closed` outcome (`update-issue <id> <n> externally_closed`), drop it from the in-flight set, and surface to the user (`#<N>: closed externally — not re-dispatched`). Do **not** open a PR or re-dispatch — the issue is gone, and re-entering Phase 5 against a closed issue would either fail or produce orphan work. `externally_closed` qualifies for Phase 8 garbage collection alongside `merged`/`errored` (see § Garbage collection).
 
 **Steady-state ticks are silent.** The digest-emission rule above (line 540) gates digests on `at least one issue is in-flight (in-progress or automerge_set)`, so the all-parked row by definition emits no digest on tick. Likewise the parked-issue poll only emits a chat line on a *change* (the three "Action on change" branches above) — a no-change tick is silent. This is intentional: an hourly heartbeat with nothing to report would be noise. Do not add a "no change" digest line to this branch; the next signal the user sees is either a real change event or the run completing.
@@ -1413,14 +1416,14 @@ When the loop drains (no more eligible issues, in-flight count = 0):
 
 1. Compile parked questions into ONE batched message to user, numbered and grouped by issue.
 2. Wait for answers.
-3. After answers: update affected issue bodies via `gh issue edit <n> --body`, remove `blocked` labels, and flip each newly-unblocked issue's state in the session state file from `blocked` back to `scheduled` so the next Phase 5 tick re-dispatches it:
+3. After answers: update affected issue bodies via `gh issue edit <n> --body`, remove `blocked` labels, and flip each newly-unblocked issue's state in the session state file from `blocked` back to `scheduled` — clearing the now-stale `blocked_question` field on the same call so downstream readers (progress digest, `--session list`) don't keep surfacing an already-answered question — so the next Phase 5 tick re-dispatches it:
 
    ```bash
    bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" update-issue \
-     "$session_id" <n> scheduled
+     "$session_id" <n> scheduled blocked_question=
    ```
 
-   Then re-enter Phase 5. (Same `update-issue <n> scheduled` call the Phase 1.0 `--resume` selective-Phase-2 path uses for resumed-`blocked` issues — both paths converge on the same unblock-on-answer transition.)
+   Then re-enter Phase 5. (Same `update-issue <n> scheduled blocked_question=` call the Phase 1.0 `--resume` selective-Phase-2 path uses for resumed-`blocked` issues — both paths converge on the same unblock-on-answer transition. The empty-string assignment is the canonical "cleared" representation; the helper allow-list only permits string values.)
 
 ## Phase 8 — Completion
 
