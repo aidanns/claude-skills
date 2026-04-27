@@ -218,8 +218,8 @@ TaskCreate(subject: "Process issue #<n> (<short title>)",
 
 Track task lifecycle in lockstep with the issue label lifecycle:
 
-- On dispatch (Phase 5 step 3): `TaskUpdate(status: "in_progress")`.
-- On `MERGED` notification (Phase 5 step 4): `TaskUpdate(status: "completed")`.
+- On dispatch (Phase 5 step 2): `TaskUpdate(status: "in_progress")` — issued as a **standalone tool call**, not bundled with the `gh issue edit` label flip or the `Agent` dispatch. See Phase 5 step 2 and the "Why standalone TaskUpdate" note in Phase 6 for the cancellation hazard.
+- On `MERGED` notification (Phase 5 step 5): `TaskUpdate(status: "completed")` — issued as a **standalone tool call** in Phase 6 step 1, not bundled with the worktree / pull / label cleanup. Same reasoning.
 - On `AUTOMERGE_SET`: leave the task `in_progress`; flip to `completed` when the Phase 5b shell monitor emits `MERGED`.
 - On `BLOCKED` / `PAUSED`: leave `in_progress`; update the task `description` with the parked question / pause reason so the task list surfaces *why* it is parked, not just that it is.
 
@@ -252,13 +252,21 @@ Loop until every issue is terminal (merged, parked, or excluded):
 
 1. **Pick next issue** — topologically eligible (all declared deps merged), not already in-progress / parked / merged. If nothing eligible but in-flight count < 3, the loop waits for a current agent to terminate.
 
-2. **Mark in-progress**:
+2. **Flip the task to `in_progress` — as a standalone tool call, not bundled with any other tool call.**
+
+   ```text
+   TaskUpdate(taskId: <task-id>, status: "in_progress")
+   ```
+
+   This MUST be its own tool-call group. Do not parallelise it with the `gh issue edit` call in step 3 or with the `Agent` dispatch in step 4. Same reasoning as Phase 6 step 1 — see "Why standalone TaskUpdate" at the end of Phase 6 for the cancellation hazard.
+
+3. **Mark in-progress on the issue** (separate tool-call group from step 2):
 
    ```bash
    gh issue edit <n> --add-label in-progress --remove-label scheduled
    ```
 
-2a. **Pre-dispatch stale-path scan** — applies *only* to issues whose declared deps merged after Phase 1 intake (i.e. mid-run). Skip otherwise.
+3a. **Pre-dispatch stale-path scan** — applies *only* to issues whose declared deps merged after Phase 1 intake (i.e. mid-run). Skip otherwise.
 
    When a dep PR rearranges code (renames a package, collapses one module into another), file paths quoted in the dependent issue's body — `packages/foo/src/foo/bar.py:78–91`, `src/auth/login.ts`, etc. — go stale. The dispatched agent reads the issue body verbatim, so a stale path either burns tokens hunting for files that no longer exist or, worse, leads the agent to recreate the moved structures rather than editing the new ones.
 
@@ -298,9 +306,9 @@ Loop until every issue is terminal (merged, parked, or excluded):
 
    Inject the preamble's stdout into the dispatch prompt (see the dispatch template below). If the array is empty, omit the section — exactly the same convention the Phase 1 auto-memory sweep uses.
 
-3. **Dispatch agent** with `isolation: worktree`, `run_in_background: true`. Use the **dispatch prompt template** below.
+4. **Dispatch agent** with `isolation: worktree`, `run_in_background: true`. Use the **dispatch prompt template** below. This is its own tool-call group — do not parallelise the `Agent` call with the `TaskUpdate` from step 2 or the `gh issue edit` from step 3.
 
-4. **Monitor** — Claude Code notifies the orchestrator when each background agent completes. On notification:
+5. **Monitor** — Claude Code notifies the orchestrator when each background agent completes. On notification:
    - **MERGED**: GitHub closed the issue via `Closes #<n>`. Mark task done; pick up the next eligible issue.
    - **AUTOMERGE_SET**: agent set automerge and exited. Slot is now free — pick up the next eligible issue. The orchestrator hands off to **Phase 5b** (post-automerge monitoring): a thin shell monitor polls the PR; auto-resolves `BEHIND` in-shell; emits events that the orchestrator routes to focused mini-agents for `CONFLICT` / `CI_FAILURE` / `NEW_COMMENT`; exits on `MERGED`. **Review-fallback check:** if the PR body contains a `### Self-review only` section (the implementing agent's harness lacked the `Task` / `general-purpose` subagent type), dispatch a separate review subagent at the orchestrator level *before* the merge lands. Use the same review prompt the dispatch template's 6.1 would have used and treat its output as a normal review pass — any findings flow back to the PR via inline `Claude Reviewer: ` comments and the Phase 5b monitor's `NEW_COMMENT` event will route them to the review-comment mini-agent.
    - **BLOCKED**: ensure `blocked` label set, `in-progress` removed; record the question for batched surfacing in Phase 7.
@@ -309,7 +317,28 @@ Loop until every issue is terminal (merged, parked, or excluded):
 
    The harness occasionally fires duplicate `task-notification` events for an agent after it has already terminated — recognisable by 0 tool uses and a generic-sounding result string. Ignore these; rely on your own Monitor task or PR-state polling for ground truth.
 
-5. **Continue** until all terminal.
+6. **Continue** until all terminal.
+
+### Worked example: correct Phase 5 dispatch shape
+
+Picking up issue #281 from `scheduled` for dispatch, the orchestrator's next three tool-call groups should be:
+
+```text
+# Group 1 — standalone TaskUpdate. Nothing else in this group.
+TaskUpdate(taskId: "<task-id-for-281>", status: "in_progress")
+```
+
+```bash
+# Group 2 — issue label flip. Cheap and recoverable on its own.
+gh issue edit 281 --add-label in-progress --remove-label scheduled
+```
+
+```text
+# Group 3 — dispatch the implementing agent.
+Agent(subagent_type: "general-purpose", prompt: "<dispatch prompt>", isolation: "worktree", run_in_background: true)
+```
+
+A failure in the `gh issue edit` call cancels only itself, not the already-completed `TaskUpdate`. The label flip retries cleanly. Same logic for the `Agent` dispatch.
 
 ### Progress reporting
 
@@ -422,7 +451,7 @@ Merge mechanism: <one of `apply <label> label (merge-bot picks it up)` or `gh pr
 <if any deps merged: Dependency context — these issues already merged and may have introduced helpers / types / files you should reuse:
 - #<dep>: <PR title>. Summary: <one-line summary of what merged>.>
 
-<if the Phase 5 step 2a stale-path scan found stale paths in the issue body (only when deps merged mid-run):
+<if the Phase 5 step 3a stale-path scan found stale paths in the issue body (only when deps merged mid-run):
 Stale paths (deps merged mid-run): the following paths quoted in the issue body above no longer exist in HEAD — locate the new home before editing instead of recreating the moved structures:
 - <path 1>
 - <path 2>
@@ -682,7 +711,7 @@ The other resilience win: a crashed monitor doesn't lose pipeline state — it j
 
 ### Handoff
 
-When step 4 of the Phase 5 execution loop receives `AUTOMERGE_SET <pr-url>` from a dispatched agent:
+When step 5 of the Phase 5 execution loop receives `AUTOMERGE_SET <pr-url>` from a dispatched agent:
 
 1. Mark the issue as `automerge_set` in internal state (the slot is free; `in-flight` count drops).
 2. Launch the **shell monitor** (below) for that PR via the `Monitor` tool. The monitor's stdout is an event stream the orchestrator consumes.
@@ -950,7 +979,15 @@ Return EXACTLY ONE of:
 
 When the orchestrator observes a `MERGED` event — either from an implementing agent's terminal `MERGED <pr-url>` return (synchronous merge case) or from the Phase 5b shell monitor's `MERGED <pr-url>` event (the `AUTOMERGE_SET → MERGED` handoff):
 
-1. **Confirm the issue closed** (`gh issue view <n> --json state` should report `CLOSED`). **If still OPEN, close manually:**
+1. **Flip the task to `completed` — as a standalone tool call, not bundled with any other tool call.**
+
+   ```text
+   TaskUpdate(taskId: <task-id>, status: "completed")
+   ```
+
+   This MUST be its own tool-call group. Do not parallelise it with the `gh issue view`, `gh issue close`, `gh issue edit`, `git worktree remove`, or `git pull` calls below. See "Why standalone TaskUpdate" at the end of this phase for the cancellation hazard this avoids.
+
+2. **Confirm the issue closed** (`gh issue view <n> --json state` should report `CLOSED`). **If still OPEN, close manually:**
 
    ```bash
    gh issue close <n> --comment "Closed by merge of PR #<P> (squash commit <sha>). Auto-close didn't fire — closing manually."
@@ -958,9 +995,35 @@ When the orchestrator observes a `MERGED` event — either from an implementing 
 
    GitHub's auto-close-on-`Closes #N` is unreliable for App-token-mediated API merges (observed in repos using a merge-bot pattern with bypass-actor App tokens). Don't wait for it; verify and close yourself.
 
-2. **Remove the worktree** at the path returned in the agent's notification. The existing `/close-worktree` skill encapsulates this — `cd` out of the worktree, `git worktree remove --force <path>`, then `git worktree prune`. Reuse that skill rather than re-deriving the steps. This step is required: `isolation: worktree` only auto-cleans when the agent made no changes, and a successful run always makes changes — so without explicit removal, every merged PR leaves a locked worktree under `.claude/worktrees/agent-<id>/` that grows disk and inode cost monotonically.
+3. **Remove the worktree** at the path returned in the agent's notification. The existing `/close-worktree` skill encapsulates this — `cd` out of the worktree, `git worktree remove --force <path>`, then `git worktree prune`. Reuse that skill rather than re-deriving the steps. This step is required: `isolation: worktree` only auto-cleans when the agent made no changes, and a successful run always makes changes — so without explicit removal, every merged PR leaves a locked worktree under `.claude/worktrees/agent-<id>/` that grows disk and inode cost monotonically.
 
-3. **Update task state.** The `in-progress` label persists on the closed issue (intentional — preserves audit trail). Flip the in-flight `TaskCreate` task to `completed` and pick up the next eligible issue.
+4. **Pick up the next eligible issue.** The `in-progress` label persists on the closed issue (intentional — preserves audit trail).
+
+### Worked example: correct Phase 6 shape
+
+After the orchestrator observes `MERGED https://github.com/o/r/pull/91` for issue #281, the next two tool-call groups should be:
+
+```text
+# Group 1 — standalone TaskUpdate. Nothing else in this group.
+TaskUpdate(taskId: "<task-id-for-281>", status: "completed")
+```
+
+```bash
+# Group 2 — parallel cleanup. Failures here are recoverable; the task flip already landed.
+gh issue view 281 --json state
+gh issue close 281 --comment "..."        # only if step 2 found it OPEN
+git worktree remove --force <worktree-path>
+git worktree prune
+git pull origin main                       # in the orchestrator's checkout
+```
+
+The cleanup group can fail any of its calls without losing the task transition. Retry the failing call(s); the `TaskUpdate` is already done.
+
+### Why standalone TaskUpdate
+
+When `TaskUpdate(status: "completed")` is bundled into the same parallel tool-call group as the cleanup `Bash` calls (`git pull`, `git worktree remove`, `gh issue edit`, etc.), a failure in *any* of those Bash calls causes the harness to cancel every still-pending tool call in the batch — including the `TaskUpdate`. The Bash failure is visible and gets retried; the cancelled `TaskUpdate` is silently dropped, and the local task stays `in_progress` while the issue is closed on GitHub. The drift is invisible until run end.
+
+`TaskUpdate` is cheap (a local harness call, not a network call) and never fails on its own, so isolating it costs nothing and protects the most important state transition in this phase. Future authors: do **not** "optimise" by re-bundling.
 
 ## Phase 7 — Block handling
 
