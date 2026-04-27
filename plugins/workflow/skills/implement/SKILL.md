@@ -118,7 +118,46 @@ Two paths, mutually exclusive:
   bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" get <id>
   ```
 
-  If the file is missing, **bail out hard** — see § Bail-outs. Do not auto-create. On success, the file contains everything Phase 1 / Phase 2 / Phase 3 would otherwise re-derive: selector args, resolved issue list, dep graph, per-issue terminal state, and the progress-digest tail. Skip the issue-list resolution, the Phase 2 clarification batch (already-confirmed clarifications were applied to issue bodies on the original run), and the Phase 3 dep-analysis pass (deps were declared and persisted). Re-enter the pipeline at Phase 4 — but **only to apply labels and create TaskList tasks for issues whose persisted state is `scheduled` or `in-progress`**; merged / blocked / paused / errored / externally_closed issues keep their existing state and are surfaced in the next progress digest. Phase 5 step 0 (per-issue resumption check) then runs as normal for every non-terminal issue.
+  If the file is missing, **bail out hard** — see § Bail-outs. Do not auto-create. On success, the file contains everything Phase 1 / Phase 2 / Phase 3 would otherwise re-derive: selector args, resolved issue list, dep graph, per-issue terminal state, and the progress-digest tail. Skip the issue-list resolution and the Phase 3 dep-analysis pass (deps were declared and persisted on the original run). Re-enter the pipeline at Phase 4 — but **only to apply labels and create TaskList tasks for issues whose persisted state is `scheduled` or `in-progress`**; merged / paused / errored / externally_closed issues keep their existing state and are surfaced in the next progress digest. Phase 5 step 0 (per-issue resumption check) then runs as normal for every non-terminal issue.
+
+  **Phase 2 on `--resume` is selective, not skipped.** Issues whose persisted state is one of `merged`, `errored`, `paused`, `in-progress`, or `scheduled` already had their clarifications applied to the issue body on the original run (or weren't holding any outstanding clarification), so re-asking would be noise — use the cached body and skip Phase 2 for those. Issues whose persisted state is **`blocked`** are different: they parked on a clarification request that the *prior* (now-gone) conversation held in chat, and the question never made it onto the issue body. The state file's `blocked_question` field has it, and a `Claude: Blocked — <question>` comment was posted to the issue at the park (see Phase 7 / the dispatch template's "Blocker handling" — both write the same comment). Re-run Phase 2 selectively for the resumed-`blocked` set:
+
+  1. For each issue with `state == "blocked"`, re-fetch the issue body fresh (`gh issue view <n> --json body --jq .body`) — the user may have edited it out-of-band while the session was gone. Read the latest `Claude: Blocked — <question>` comment via `gh issue view <n> --comments` (or `gh api repos/:owner/:repo/issues/<n>/comments` if a tighter probe is needed) and prefer that as the canonical question text; fall back to the state file's `blocked_question` only if the comment is missing (e.g. the user deleted it).
+  2. Compile the resumed-`blocked` questions into the same single batched message Phase 2 already uses — numbered, grouped by issue — alongside any other resumed-blocked issues in the run. Surface to the user. Wait for answers.
+  3. After answers, apply each answer via `gh issue edit <n> --body "<updated>"` (so a future dispatch reads the resolved context from the issue body, not from chat history) and remove the `blocked` label.
+  4. **Flip the per-issue state in the session state file from `blocked` back to `scheduled`** so Phase 5 dispatch picks the issue up on the next loop tick:
+
+     ```bash
+     bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" update-issue \
+       "$session_id" <n> scheduled
+     ```
+
+     The `update-issue` allow-list already permits the `blocked → scheduled` transition; no schema change is needed.
+
+  Worked example. State file says `#412` is `blocked` with `blocked_question: "Should the new export use kebab-case or snake_case for the env var name?"`. On `--resume`:
+
+  ```bash
+  # 1. Fresh fetch (body may have changed while we were gone) + latest Claude: Blocked comment.
+  gh issue view 412 --json body --jq .body
+  gh issue view 412 --comments  # find the latest "Claude: Blocked — …" comment
+  # Latest comment: "Claude: Blocked — Should the new export use kebab-case or snake_case…"
+
+  # 2. Orchestrator batches this question with any other resumed-blocked issues into ONE message:
+  #    "Resumed clarifications:
+  #       1. #412 — Should the new export use kebab-case or snake_case for the env var name?
+  #       2. #418 — …"
+  #    Surfaces to user, waits.
+
+  # 3. User answers "kebab-case". Orchestrator applies it to the issue body and drops the gate label:
+  gh issue edit 412 --body "<existing body + 'Decision: env var name uses kebab-case (CLAUDE_FOO_BAR).'>"
+  gh issue edit 412 --remove-label blocked
+
+  # 4. Flip the session state from blocked → scheduled so Phase 5 picks it up.
+  bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" update-issue \
+    "$session_id" 412 scheduled
+  ```
+
+  Phase 5 then dispatches `#412` on its next loop tick exactly as it would for any freshly-scheduled issue. (The `Closes #N` PR will reach merge through the normal pipeline; nothing about the resumed-from-`blocked` path differs after this point.)
 
   Log the resumed session ID once, chat-visible, with a one-line summary so the user can confirm:
 
@@ -294,6 +333,8 @@ If clarifications exist:
 4. Proceed.
 
 If no clarifications: continue silently.
+
+On `--resume`, this same flow runs **selectively** — only for issues whose persisted state is `blocked` (they parked on a question the prior conversation held in chat, never persisted to the issue body). All other resumed issues skip Phase 2 and use the cached body. See Phase 1.0's `--resume` branch for the selective-re-run mechanics and worked example.
 
 ## Phase 3 — Dependency analysis
 
@@ -1372,7 +1413,14 @@ When the loop drains (no more eligible issues, in-flight count = 0):
 
 1. Compile parked questions into ONE batched message to user, numbered and grouped by issue.
 2. Wait for answers.
-3. After answers: update affected issue bodies via `gh issue edit <n> --body`, remove `blocked` labels, restart agents on those issues. Re-enter Phase 5.
+3. After answers: update affected issue bodies via `gh issue edit <n> --body`, remove `blocked` labels, and flip each newly-unblocked issue's state in the session state file from `blocked` back to `scheduled` so the next Phase 5 tick re-dispatches it:
+
+   ```bash
+   bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" update-issue \
+     "$session_id" <n> scheduled
+   ```
+
+   Then re-enter Phase 5. (Same `update-issue <n> scheduled` call the Phase 1.0 `--resume` selective-Phase-2 path uses for resumed-`blocked` issues — both paths converge on the same unblock-on-answer transition.)
 
 ## Phase 8 — Completion
 
