@@ -635,7 +635,7 @@ Apply this filter before relaying any event to the user:
 - Orchestrator-level review subagent finished: `LGTM` (review state moves to `done (LGTM)`) or `FINDINGS <count>` (review state moves to `done (<count> findings)`).
 - Address-review mini-agent terminal return: `READY_TO_MERGE` (orchestrator is about to set automerge).
 - Orchestrator sets automerge (the LGTM or `READY_TO_MERGE` branch fires the merge handoff per the observed `Merge mechanism:` line) — this is the "merging" state in the state machine.
-- Phase 5b shell-monitor events: `MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `BEHIND_RESOLVE_FAILED` (the monitor's `git push` was rejected after a local catch-up — usually a PAT-scope issue; the PR is parked until the user intervenes), `STALLED_GREEN` (the merge bot didn't fire after CI went green; the orchestrator is running the tier 2 / 3 / 4 ladder).
+- Phase 5b shell-monitor events: `MERGED`, `CLOSED` (PR closed without merging — surface so the user notices the run won't reach all-terminal), `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `BEHIND_RESOLVE_FAILED` (the monitor's `git push` was rejected after a local catch-up — usually a PAT-scope issue; the PR is parked until the user intervenes), `STALLED_GREEN` (the merge bot didn't fire after CI went green; the orchestrator is running the tier 2 / 3 / 4 ladder).
 - Phase 5b mini-agent terminal returns: `RESOLVED` (conflict-resolution), `FIXED` (CI-failure-fix), `ADDRESSED` (review-comment), `ENVIRONMENTAL` (CI-failure-fix flake/infra).
 - A new check `conclusion == "FAILURE"` newly observed in the rollup (the digest's `CI: red` count goes up).
 - A new merge conflict newly observed (`mergeStateStatus == "DIRTY"` newly seen — the digest's `merge: conflict` first appears).
