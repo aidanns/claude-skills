@@ -309,6 +309,27 @@ The script keeps all JSON manipulation inside `jq`; the orchestrator should not 
 
 The state file is deleted in Phase 8 once every issue is **fully resolved** — `merged`, `errored`, or `externally_closed`. `blocked` and `paused` do not count as fully resolved (the user is expected to come back via `--resume <id>`); see Phase 8.1 for the rule. The `externally_closed` outcome is terminal in the same sense `merged` is — the issue is gone, no further orchestrator action is possible — so it qualifies for GC alongside `merged`/`errored` (otherwise an externally-closed issue would orphan the state file). A leftover file means a run aborted before reaching Phase 8 *or* parked on user input; `--session list` will surface it and the user can `--resume <id>` or manually clear it. A future `--session forget <id>` flag could expose the `delete` subcommand directly for explicit cleanup, but until then `rm ~/.claude/state/workflow-implement/<id>.json` is the manual escape hatch.
 
+### Recovering a corrupted state file
+
+A long-running session that survives a kernel panic / disk-full / SIGKILL can leave the state file truncated mid-write or otherwise unparseable. The orchestrator detects this on `--resume <id>` (see § Bail-outs) and `--session list` flags the file with `(corrupted — see § Session state recovery)` instead of silently skipping it, so the user has a clear signal that something is wrong. There is no in-skill auto-repair today — the user explicitly chooses between "fix the JSON by hand" (preserves dep graph + digest history) and "delete and re-derive" (loses both, but unblocks). Manual recovery sequence:
+
+1. **Back up the file before touching it.** A surprise edit that makes things worse is recoverable from the backup; an in-place botched repair is not:
+   ```bash
+   cp ~/.claude/state/workflow-implement/<id>.json{,.bak}
+   ```
+2. **Try to fix the JSON manually.** `jq . ~/.claude/state/workflow-implement/<id>.json` is the quickest validator — it points at the line / column where parsing failed. Common breakage patterns:
+   - **Truncated mid-write** — the closing `}` (or `]` on `digest_tail`) is missing because a SIGKILL caught the process between `jq` finishing and `mv` committing the temp file. Fix: append the missing brackets in nesting order; re-run `jq .` until it parses.
+   - **Partial array element** — a `digest_tail` entry was half-serialised (`{"ts": "..."` with no `line` field and no closing `}`). Fix: trim the dangling fragment and the trailing comma so the array closes cleanly.
+   - **Corrupted UTF-8** — a non-UTF-8 byte landed in a string field (typically `blocked_question` or a `digest_tail` line). Fix: open in an editor that can show byte offsets and replace the offending byte; or `iconv -f utf-8 -t utf-8 -c` to drop invalid sequences.
+   Validate after each edit: `jq . ~/.claude/state/workflow-implement/<id>.json >/dev/null` should exit 0.
+3. **If unfixable, delete and start over.** This loses the dep graph and the `digest_tail` (the per-issue terminal state can be re-derived from GitHub labels on the next run, but the orchestrator-only context cannot):
+   ```bash
+   rm ~/.claude/state/workflow-implement/<id>.json
+   /workflow:implement <original selector>   # fresh ID; same labels still on the issues
+   ```
+   The fresh run will re-resolve the issue list, re-build the dep graph from `Depends on:` markers in issue bodies, and pick up `in-progress` issues via Phase 5 step 0's per-issue resumption probe. The lost `digest_tail` only affected `--resume`-time context display; it has no functional impact on the run.
+4. **(Future)** A future `--session repair <id>` flag could automate steps 1-3 — parse-validate the file, back it up to `<id>.json.broken-<timestamp>`, and re-derive a minimal state from GitHub (the resolved issue list, current per-issue states from labels) with empty `digest_tail` and empty `deps`. The user would accept the dep-graph / digest loss explicitly. Tracked separately; not in this skill today.
+
 ### Layering with Phase 5 step 0
 
 `--resume` and Phase 5 step 0 cover different layers and compose cleanly:
@@ -1483,6 +1504,7 @@ The skill stops the run rather than parking when:
 - A dispatched agent reports a *non-recoverable* environmental error (cannot clone, cannot authenticate, missing required CLI tool).
 - The dependency graph contains a cycle.
 - **`--resume <id>` was passed but `~/.claude/state/workflow-implement/<id>.json` does not exist.** Do not auto-create — surface the error verbatim ("session state not found: <id>") and exit. The user typically wants to either (a) check for typos in the ID, (b) run `--session list` to see what is actually resumable, or (c) start a fresh run instead.
+- **`--resume <id>` was passed and the state file exists but is unparseable JSON** (truncated mid-write after a crash / disk-full / SIGKILL, partial schema, corrupted UTF-8). Surface the error verbatim ("session state corrupted: <path>") and point the user at **§ Session state § Recovering a corrupted state file** for the manual recovery sequence. Do not attempt to repair in-place — re-deriving from a half-written file is how silent state-divergence happens. The user explicitly chooses between "fix the JSON by hand" and "delete the file and lose dep graph / digest history."
 - **`--resume <id>` was combined with a selector flag** (`--label`, `--milestone`, `--parent`, or explicit issue numbers). The resumed state file already encodes the original selector; combining the two is ambiguous. Surface "--resume cannot be combined with selector flags" and exit.
 
 In each case: leave labels as-is, surface immediately to user, do not proceed.

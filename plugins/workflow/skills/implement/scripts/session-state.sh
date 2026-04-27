@@ -39,7 +39,11 @@
 #
 #   list
 #       List every state file in the directory: ID, repo, selector summary,
-#       last-modified ISO-8601 timestamp, in-flight issue count.
+#       last-modified ISO-8601 timestamp, in-flight issue count. Files that
+#       fail to parse as JSON are surfaced with a `(corrupted — see § Session
+#       state recovery)` annotation instead of being silently skipped, so the
+#       user sees there is a problem and can follow the manual recovery
+#       sequence in SKILL.md.
 #
 #   delete <id>
 #       Remove the state file. No-op if it doesn't exist (the all-terminal
@@ -227,11 +231,22 @@ cmd_list() {
   if [[ ! -d "$state_dir" ]]; then
     return 0
   fi
-  local f mtime
+  local f mtime id
   for f in "$state_dir"/*.json; do
     [[ -f "$f" ]] || continue
     mtime=$(date -u -r "$f" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
             || stat -c '%y' "$f" | cut -d. -f1)
+    # Surface unparseable state files instead of silently skipping. Without
+    # this, a corruption (truncated mid-write, partial schema after a crash,
+    # bad UTF-8) would simply not appear in `--session list` and the user
+    # would have no signal that anything is wrong — they'd just see their
+    # session go missing. Print a flagged row pointing at the recovery prose
+    # in SKILL.md § Session state § Recovering a corrupted state file.
+    if ! jq -e . "$f" >/dev/null 2>&1; then
+      id=$(basename "$f" .json)
+      printf '%s\t(corrupted — see § Session state recovery)\t%s\t\t\n' "$id" "$mtime"
+      continue
+    fi
     # Single jq invocation per file. "in-flight" = anything not
     # fully-resolved (i.e. not merged / errored / externally_closed).
     jq -r --arg mtime "$mtime" '
