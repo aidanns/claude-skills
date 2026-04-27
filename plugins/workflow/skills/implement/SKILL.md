@@ -1043,11 +1043,26 @@ When the loop drains (no more eligible issues, in-flight count = 0):
 
 The orchestrator's `TaskList` is the canonical state surface — every in-scope issue has a tracking task that flips through `pending` → `in_progress` → `completed` (or stays `in_progress` on `BLOCKED` / `PAUSED`). The chat-visible final report below is a one-shot snapshot at run end, not the source of truth; refer back to `TaskList` for live state.
 
+### Phase 8.0 — TaskList ↔ GitHub reconciliation (defensive backstop)
+
+Before emitting the final report, walk every in-scope issue (the list resolved in Phase 1) and reconcile the local `TaskList` against GitHub's view. This is a **backstop**, not the primary fix — the source-fix is the standalone `TaskUpdate` rule in Phase 6 step 3 (and Phase 5 steps 2–3) that prevents drift from arising in the first place. Phase 8.0 catches whatever slips through: harness cancellations on bundled tool-call groups, transient `gh` failures that wedged a state transition, manual close+reopen races, etc.
+
+For each in-scope issue `<n>`:
+
+1. `gh issue view <n> --json state` to read the current GitHub state.
+2. If `state == "CLOSED"` and the corresponding task is still `in_progress` or `pending`, flip it via a standalone `TaskUpdate(taskId: <task-id>, status: "completed")` call. Record the reconciliation in a list for the final-report log line.
+3. If `state == "OPEN"` and the corresponding task is `completed`, **do not** auto-revert — log the inconsistency for the final report. This direction usually indicates a deeper bug (squash-merge dropped the `Closes #N` footer, manual close+reopen race, merge-bot rolled back) that warrants human investigation, not silent rewriting of local state.
+
+Run reconciliation regardless of how Phase 5/6/7 ended — even on a clean run with zero observed errors, because the cancellation hazard is silent by definition. The cost is one `gh issue view` per in-scope issue.
+
+The run is still considered **successful** even if reconciliation had to flip tasks; it's a backstop firing as designed. Surface a one-line log in the final report noting which task IDs / issue numbers were reconciled (and which OPEN-but-completed inconsistencies were detected), so the user can investigate if a particular dispatch keeps drifting — repeated reconciliations for the same code path is a signal that the Phase 6 source-fix has regressed.
+
 Final report to user:
 
 - N issues processed: X merged, Y parked, Z excluded.
 - Links to merged PRs.
 - Outstanding parked questions (if any) — `blocked` label remains, awaiting attention.
+- Reconciliation log (one line, only if Phase 8.0 flipped anything or detected an OPEN-but-completed inconsistency).
 - Suggested next step: `/workflow:implement --label blocked` to resume parked issues after answering.
 
 ## Bail-outs (stop the entire run)
