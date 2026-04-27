@@ -589,9 +589,19 @@ If the failure is environmental (infra outage, rate limit, unrelated to your dif
 
 #### 6.4 Set automerge — TERMINAL STEP
 
+**Precondition — run this probe before applying any merge-trigger:**
+
+    gh pr view <pr#> --json statusCheckRollup \
+      --jq '[.statusCheckRollup[] | select(.conclusion=="FAILURE")] | length'
+    # expected: 0
+
+If the probe returns >0, loop back to 6.3 — **do not set automerge**. Your prose recollection of "all checks passed" is not a substitute; the rollup is the source of truth, and the contract here fails open if you skip this. (Observed in the wild: an agent returned `AUTOMERGE_SET` while three checks were still in `conclusion: FAILURE`, because it trusted its own summary instead of re-querying the rollup.)
+
+*Known-environmental carve-out:* if every remaining failure is a documented infra/rate-limit issue per 6.3 (and noted in the PR body), you may proceed; otherwise the >0 result is blocking.
+
 **Do NOT remove the `in-progress` label when applying `automerge`.** The label persists from worktree-creation through merge — that's the audit trail of who handled the issue. The label only comes off on `BLOCKED` (replaced by `blocked`) or `PAUSED` (replaced by `paused`); otherwise the orchestrator (or GitHub's auto-close) handles cleanup after merge confirmation.
 
-Once review comments are addressed AND CI is green (or known-environmental), hand off to merge by reading the `Merge mechanism:` line from the "Current PR conventions (observed)" block above:
+Once review comments are addressed AND the probe above returns 0 (or only known-environmental failures remain), hand off to merge by reading the `Merge mechanism:` line from the "Current PR conventions (observed)" block above:
 
 - If `Merge mechanism: apply <label> label (merge-bot picks it up)` — apply the label and let the project's merge-bot drive the merge:
 
@@ -624,6 +634,12 @@ gh api 'repos/{owner}/{repo}/pulls/<pr#>/comments' --paginate \
 gh pr view <pr#> --json statusCheckRollup \
   --jq '[.statusCheckRollup[] | select(.conclusion=="FAILURE")] | length'
 # expected: 0 (or only known-environmental — see 6.3 for handling)
+
+# 6.4 precondition — re-run the failure-count probe immediately before the merge-trigger
+# (this is the hard gate from 6.4; the 6.3 run above is for diagnosis, this run is the contract):
+gh pr view <pr#> --json statusCheckRollup \
+  --jq '[.statusCheckRollup[] | select(.conclusion=="FAILURE")] | length'
+# expected: 0 — if >0, loop back to 6.3, do not proceed.
 
 # 6.4 — hand off to merge per the `Merge mechanism:` line in the observed-PR-conventions block.
 # If the line says `apply automerge label (merge-bot picks it up)`:
