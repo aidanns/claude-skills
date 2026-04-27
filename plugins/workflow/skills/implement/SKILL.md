@@ -416,7 +416,7 @@ Apply this filter before relaying any event to the user:
 - PR opened (URL first appears in the digest — agent transitioned out of `implementing`).
 - Code-review subagent finished (review state moves from `pending` to `done`).
 - Implementing-agent terminal returns: `AUTOMERGE_SET`, `MERGED`, `BLOCKED`, `PAUSED`, `ERRORED`.
-- Phase 5b shell-monitor events: `MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`.
+- Phase 5b shell-monitor events: `MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `BEHIND_RESOLVE_FAILED` (the monitor's `git push` was rejected after a local catch-up — usually a PAT-scope issue; the PR is parked until the user intervenes).
 - Phase 5b mini-agent terminal returns: `RESOLVED` (conflict-resolution), `FIXED` (CI-failure-fix), `ADDRESSED` (review-comment), `ENVIRONMENTAL` (CI-failure-fix flake/infra).
 - A new check `conclusion == "FAILURE"` newly observed in the rollup (the digest's `CI: red` count goes up).
 - A new merge conflict newly observed (`mergeStateStatus == "DIRTY"` newly seen — the digest's `merge: conflict` first appears).
@@ -774,8 +774,19 @@ while :; do
       cd repo
       git fetch origin "$base" >/dev/null 2>&1 || exit 0
       if git merge --no-edit "origin/$base" >/dev/null 2>&1; then
-        git push origin "$branch" >/dev/null 2>&1 || true
-        emit "BEHIND_RESOLVED $pr"
+        # Capture push stderr so we can surface failures (e.g. PAT missing
+        # `workflow` scope rejecting changes under `.github/workflows/*`).
+        # Only emit BEHIND_RESOLVED when the push actually landed; otherwise
+        # the next tick would observe BEHIND again and silently loop.
+        push_err=$(git push origin "$branch" 2>&1 >/dev/null)
+        push_rc=$?
+        if [[ $push_rc -eq 0 ]]; then
+          emit "BEHIND_RESOLVED $pr"
+        else
+          # Collapse newlines/tabs so the event line stays single-line.
+          reason=$(printf '%s' "$push_err" | tr '\n\t' '  ' | sed 's/  */ /g')
+          emit "BEHIND_RESOLVE_FAILED $pr $reason"
+        fi
       else
         # The merge produced conflicts — escalate via the CONFLICT path below
         # on the next tick (don't double-emit here).
@@ -827,9 +838,12 @@ done
 Key behaviours:
 
 - **`BEHIND` auto-resolution stays in-shell.** Uses the same local-merge approach the implementing agent uses (`git fetch origin main && git merge --no-edit origin/main && git push`) — no `update-branch` API call, consistent with the rest of this skill.
+- **Push failures are surfaced, not swallowed.** `git push` stderr is captured and the exit code is checked. On failure, the monitor emits `BEHIND_RESOLVE_FAILED <pr#> <reason>` instead of `BEHIND_RESOLVED`, so a silently-rejected push (e.g. PAT missing `workflow` scope on `.github/workflows/*` changes) escalates to the user instead of the next tick re-observing BEHIND and looping. `BEHIND_RESOLVED` is only emitted when the push actually landed.
 - **Transient `gh` failures** (network blips, rate-limit retries) don't crash the loop — `|| true` and an empty-result check keep polling.
 - **Deduplication** — failing run IDs and review comment IDs are tracked, so a persistent failure escalates exactly once per ID, not on every tick.
 - **`Claude` -prefixed comments are skipped** so the monitor doesn't re-escalate on the implementing agent's or reviewer subagent's own comments.
+
+> **Related, out of scope:** cloning the PR branch via SSH (`gh config set git_protocol ssh`) would sidestep PAT-scope issues for repo writes — SSH key auth doesn't enforce the `workflow` scope. Tracked as a separate consideration; the visibility fix above is the more general improvement, since silent push failures bite in lots of ways beyond the one scope issue.
 
 ### Orchestrator event routing
 
@@ -840,6 +854,7 @@ The `Monitor` tool surfaces each stdout line of `monitor-pr.sh` as a notificatio
 | `MERGED <pr-url>` | Mark issue task `completed`. Stop the monitor. Trigger Phase 6 housekeeping. |
 | `CLOSED <pr-url>` | Surface to user — PR was closed without merging. Stop the monitor. |
 | `BEHIND_RESOLVED <pr#>` | Log only. Refresh the next progress digest. |
+| `BEHIND_RESOLVE_FAILED <pr#> <reason>` | Surface to user — the monitor caught up the branch locally but the `git push` was rejected (commonly a PAT-scope issue, e.g. missing `workflow` scope when the PR touches `.github/workflows/*`). Stop the monitor; treat the PR as parked until the user resolves the auth/permission issue. Do **not** loop — the next tick would just re-observe BEHIND and fail the same way. |
 | `CONFLICT <pr#> <branch> <base> <files>` | Dispatch the **conflict-resolution mini-agent** (template below). |
 | `CI_FAILURE <pr#> <check> <run-id>` | Size the fix first (see **CI-failure sizing rule** below). If ≤50 lines / 1-2 files, fix in-place at the orchestrator level. Otherwise dispatch the **CI-failure-fix mini-agent** (template below). |
 | `NEW_COMMENT <pr#> <comment-id>` | Dispatch the **review-comment mini-agent** (template below). |
