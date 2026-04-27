@@ -355,11 +355,15 @@ The TaskCreate list (Phase 4) is the durable surface. Augment it with a chat-vis
 1. **Find the PR** (created in step 5 of the dispatch pipeline):
 
    ```bash
-   gh pr list --state open --search "Closes #<N> in:body" \
-     --json number,url,statusCheckRollup,mergeable,mergeStateStatus --limit 1
+   gh pr list --state all --search "Closes #<N> in:body" \
+     --json number,url,state,statusCheckRollup,mergeable,mergeStateStatus --limit 1
    ```
 
-   Empty result → agent hasn't pushed yet → emit `#<N>: implementing` and skip the rest of the probe.
+   Use `--state all` (not `--state open`) so a PR that merged between ticks still appears with `state: MERGED` instead of dropping out of the result set — otherwise the empty-result branch is ambiguous between "no PR opened yet" and "PR merged".
+
+   - Empty result → no PR opened yet (agent hasn't pushed) → emit `#<N>: implementing` and skip the rest of the probe.
+   - `state == MERGED` → drop the issue from the in-flight set and emit a one-line `#<N> <pr-url> — merged` entry for this tick; skip the rest of the probe.
+   - `state == OPEN` → continue with the per-state formatting below.
 
 2. **Review status** — count `Claude Reviewer:` comments. The review subagent (step 6 of the dispatch pipeline) posts either inline review comments or a single LGTM PR-level comment with the `Claude Reviewer: ` prefix (the implementing agent uses `Claude: `, so the prefix discriminates):
 
@@ -394,7 +398,7 @@ The TaskCreate list (Phase 4) is the durable surface. Augment it with a chat-vis
 #<N> <pr-url> — review: <state> — CI: <state> — merge: <state>
 ```
 
-One line per in-flight issue. Merged / blocked / paused / errored issues drop out of the digest — their terminal state is in the task list and is summarised in Phase 8's final report.
+One line per in-flight issue. The MERGED-transition tick emits `#<N> <pr-url> — merged` once and the issue drops out of the in-flight set on subsequent ticks. Blocked / paused / errored issues drop out the same way — their terminal state is in the task list and is summarised in Phase 8's final report.
 
 Example tick output:
 
@@ -403,6 +407,7 @@ Example tick output:
 #338 https://github.com/aidanns/agent-auth/pull/451 — review: done (LGTM) — CI: green — merge: behind
 #339 https://github.com/aidanns/agent-auth/pull/452 — review: pending — CI: red (1 failing) — merge: conflict
 #340 — implementing
+#341 https://github.com/aidanns/agent-auth/pull/453 — merged
 ```
 
 #### Notification-relay policy
