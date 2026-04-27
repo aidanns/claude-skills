@@ -125,45 +125,24 @@ If the sweep returns hits, paste each matched file's body verbatim into the disp
 
 ## Phase 1.5 — Observe current PR conventions
 
-`CLAUDE.md` can lag behind reality — new conventions ship on main before the doc gets updated. Before dispatching, snapshot what the most recent merged PRs actually do:
+`CLAUDE.md` can lag behind reality — new conventions ship on main before the doc gets updated. Before dispatching, snapshot what the most recent merged PRs actually do by running the helper script colocated with this skill:
 
 ```bash
-gh pr list --state merged --limit 5 --json number,title,body,labels --jq '.[]'
+bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/phase15-conventions.sh" <owner/repo>
 ```
 
-Look for patterns the dispatched agent needs to match that may not be in `CLAUDE.md`:
+The script is the canonical implementation of this phase — it reads the 5 most recent merged PRs, computes a deterministic "Current PR conventions (observed)" block, and prints it on stdout. The orchestrator embeds that stdout *verbatim* into every dispatched agent's prompt (see the `Current PR conventions (observed)` placeholder in the dispatch template). Running the script once per orchestrator invocation (rather than re-inferring the conventions from raw PR-body JSON on each dispatch) saves ~5–10K tokens per run and guarantees byte-identical conventions across parallel dispatches.
 
-- **Title prefix style** — Conventional Commits (`feat:`, `fix:`) vs. a project-specific allowlist (`feature:`, `improvement:`, `chore:`). Use whatever recently-merged titles consistently use.
-- **Title length limit** — the dispatch template defaults to ≤72 chars (standard commit-subject convention). If the repo has a commit-message-lint workflow (`.github/workflows/*commit*lint*.yml`, `commitlint.config.*`, etc.) with a different `subject-max-length`, surface the actual limit in the observations block so the dispatched agent uses the correct number.
-- **Body format** — does the body wrap the commit message in a delimited block (e.g. `==COMMIT_MSG==`)? Where do `Closes #N` and `Signed-off-by:` sit (inside the block, or outside)?
-- **Labels at merge time** — is there a `no changelog` / `automerge` / similar label that's consistently applied? Does the project use a merge-bot that requires a specific label?
-- **Manual changelog entry** — do recently-merged PRs touch `changelog/@unreleased/pr-<N>-<slug>.yml` or similar? If so, the dispatched agent must hand-author one (or apply a `no changelog` label for non-user-visible changes).
-- **Merge mechanism** — does the project rely on a label-triggered merge-bot, or on GitHub's native auto-merge? See the detection heuristic below; this finding is surfaced as a `Merge mechanism:` line so sub-step 6.4 can act on it without hardcoding a command.
+The emitted block surfaces:
 
-### Detecting the merge mechanism
+- **Title prefix style** — most-frequent leading token (`feat:`, `fix:`, `feature:`, `chore:` …) plus 2-3 sample titles, captured from the recent merged PRs.
+- **Title length limit** — defaults to ≤72 chars; overridden if a commit-message-lint config in the repo (`.github/workflows/commit*lint*.yml`, `commitlint.config.*`, `.commitlintrc.*`) declares a different `subject-max-length`.
+- **`==COMMIT_MSG==` block** — required / optional / not used, based on how many recent merged PR bodies wrap their commit message in that block. The same logic generalises to whatever named-block convention surfaces in the sample.
+- **Labels at merge time** — a histogram of every label seen across the sample (label → `<n>/<sample-size>`), so the dispatched agent can spot consistently-applied ones (`automerge`, `no changelog`, etc.).
+- **Manual changelog entries** — required / occasional / not observed, computed from how many recent PRs touched a `changelog/@unreleased/pr-<N>-<slug>.yml` file.
+- **Merge mechanism** — emitted as the `Merge mechanism:` trailer. Sub-step 6.4 of the dispatch template parses this line. Two-signal heuristic (preserved verbatim from the prior prose): (1) a workflow that listens to `pull_request: types: [labeled]` with a label-name guard, (2) that label appearing on at least half of the recent merged PRs. If both signals agree, the value is `apply <label> label (merge-bot picks it up)`; otherwise the default is `gh pr merge --auto --squash` (native auto-merge).
 
-Some projects flip `allow_squash_merge=false` and route merges through a merge-bot triggered by a label (e.g. `automerge`); on those projects, `gh pr merge --auto --squash` is at best a no-op and at worst skips the bot's commit-message extraction. To classify the project's mechanism from recent merged PRs:
-
-1. **Workflow probe.** Does the repo have a workflow whose `on:` block listens to a `pull_request: types: [labeled]` event with a label-name filter? Common paths: `.github/workflows/merge-bot.yml`, `.github/workflows/automerge*.yml`. If yes, capture the label name from the workflow's `if:` guard.
-
-   ```bash
-   gh api 'repos/{owner}/{repo}/contents/.github/workflows' \
-     --jq '.[].name' 2>/dev/null
-   # then read each candidate workflow's `on:` and `if:` blocks
-   ```
-
-2. **PR-label cross-check.** Does the captured label appear consistently on the most recent merged PRs?
-
-   ```bash
-   gh pr list --state merged --limit 5 --json number,labels \
-     --jq '.[] | {n: .number, labels: [.labels[].name]}'
-   ```
-
-   If the label appears on essentially every merged PR, the project uses the merge-bot. If the label is absent or sporadic, default to native auto-merge.
-
-If both signals agree on a label-triggered bot, record the finding as `Merge mechanism: apply <label> label (merge-bot picks it up)`. Otherwise default to `Merge mechanism: gh pr merge --auto --squash` (native auto-merge).
-
-Compile observations into a "Current PR conventions (observed)" block — including the `Merge mechanism:` line — and inject it into every dispatched agent's prompt. This beats relying on `CLAUDE.md` being current, and sub-step 6.4 of the dispatch template reads the `Merge mechanism:` line to decide what to do.
+If the helper script is unavailable for any reason (e.g. the plugin install is corrupted), the orchestrator can fall back to running the steps inline — but treat that as a degraded path and flag it. The script's output is the contract; sub-step 6.4 of the dispatch template depends on the `Merge mechanism:` trailer being present.
 
 ## Phase 2 — Pre-flight clarification
 
@@ -490,9 +469,7 @@ You are implementing GitHub issue #<N> end-to-end. The issue body follows verbat
 
 Project context: this repo's conventions are described in `CLAUDE.md` (root), `.claude/instructions/*.md` (if present), and `CONTRIBUTING.md`. Read these before editing — they define language, tooling, commit-message scopes, and any project-specific rules.
 
-Current PR conventions (observed from the most recent merged PRs — `CLAUDE.md` may not yet reflect these):
-<orchestrator's Phase 1.5 observations: title prefix style, body-block format like ==COMMIT_MSG==, label requirements like `no changelog` / `automerge`, manual changelog YAML entries, etc.>
-Merge mechanism: <one of `apply <label> label (merge-bot picks it up)` or `gh pr merge --auto --squash` — sub-step 6.4 below reads this line, do not hardcode a merge command>
+<stdout of `phase15-conventions.sh <owner/repo>` embedded verbatim — a header line "Current PR conventions (observed from the N most recent merged PRs on <repo>)…" followed by bullets covering title prefix style, title length limit, ==COMMIT_MSG== block usage, label histogram, and manual-changelog status, terminated by a `Merge mechanism:` trailer that sub-step 6.4 below parses. Do not hardcode a merge command — sub-step 6.4 reads the trailer.>
 
 <if any deps merged: Dependency context — these issues already merged and may have introduced helpers / types / files you should reuse:
 - #<dep>: <PR title>. Summary: <one-line summary of what merged>.>
