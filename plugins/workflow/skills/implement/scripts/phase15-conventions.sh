@@ -20,10 +20,29 @@ prs=$(gh pr list --repo "$repo" --state merged --limit 5 \
   --json number,title,body,labels,files)
 sample_size=$(jq 'length' <<<"$prs")
 
+# --- Native auto-merge availability ----------------------------------------
+#
+# Probe `allow_auto_merge` (REST) / `autoMergeAllowed` (GraphQL) once at
+# script-time. When it's `false`, the `gh pr merge --auto --squash` default
+# would fail with the GraphQL error `Auto merge is not allowed for this
+# repository (enablePullRequestAutoMerge)`, so the merge-mechanism decision
+# below routes to immediate `gh pr merge --squash` instead. Default to
+# `false` on probe failure (treated the same as a repo with automerge
+# disabled — safer than emitting an `--auto` flag the merge handoff can't
+# honour).
+auto_merge_allowed=$(gh api "repos/${repo}" \
+  --jq '.allow_auto_merge' 2>/dev/null || echo false)
+[[ "$auto_merge_allowed" == "true" ]] || auto_merge_allowed=false
+
 if (( sample_size == 0 )); then
-  cat <<'EOF'
-Current PR conventions (observed): no merged PRs in this repo yet — fall back to project docs (`CLAUDE.md`, `CONTRIBUTING.md`) for conventions.
-Merge mechanism: gh pr merge --auto --squash
+  if [[ "$auto_merge_allowed" == "true" ]]; then
+    default_merge='gh pr merge --auto --squash'
+  else
+    default_merge='gh pr merge --squash'
+  fi
+  cat <<EOF
+Current PR conventions (observed): no merged PRs in this repo yet — fall back to project docs (\`CLAUDE.md\`, \`CONTRIBUTING.md\`) for conventions.
+Merge mechanism: ${default_merge}
 EOF
   exit 0
 fi
@@ -126,14 +145,26 @@ fi
 
 # --- Merge mechanism --------------------------------------------------------
 #
-# Two-signal heuristic preserved verbatim from Phase 1.5 prose:
-#   1. Workflow probe: does any workflow listen to `pull_request:
-#      types: [labeled]` with a label-name guard?
-#   2. PR-label cross-check: does that label appear on essentially every
-#      recent merged PR?
-# If both signals agree, the project uses a label-triggered merge-bot;
-# otherwise default to native auto-merge.
-merge_mechanism='gh pr merge --auto --squash'
+# Three-branch decision:
+#   1. Two-signal label-triggered merge-bot heuristic (preserved verbatim
+#      from the prior Phase 1.5 prose):
+#        a. Workflow probe: does any workflow listen to `pull_request:
+#           types: [labeled]` with a label-name guard?
+#        b. PR-label cross-check: does that label appear on essentially
+#           every recent merged PR?
+#      If both signals agree, the project uses a label-triggered merge-bot.
+#   2. Else if `autoMergeAllowed == true` (probed above): native auto-merge.
+#   3. Else: immediate squash-merge — `gh pr merge --squash` (no `--auto`).
+#      Selected when GitHub auto-merge is disabled at the repo level
+#      (`autoMergeAllowed: false`); without this branch the orchestrator's
+#      merge handoff would fail with the GraphQL error
+#      `Auto merge is not allowed for this repository
+#      (enablePullRequestAutoMerge)`.
+if [[ "$auto_merge_allowed" == "true" ]]; then
+  merge_mechanism='gh pr merge --auto --squash'
+else
+  merge_mechanism='gh pr merge --squash'
+fi
 
 workflows=$(gh api "repos/${repo}/contents/.github/workflows" \
   --jq '.[]?.name' 2>/dev/null || true)
