@@ -438,7 +438,7 @@ Apply this filter before relaying any event to the user:
 - PR opened (URL first appears in the digest — agent transitioned out of `implementing`).
 - Code-review subagent finished (review state moves from `pending` to `done`).
 - Implementing-agent terminal returns: `AUTOMERGE_SET`, `MERGED`, `BLOCKED`, `PAUSED`, `ERRORED`.
-- Phase 5b shell-monitor events: `MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `BEHIND_RESOLVE_FAILED` (the monitor's `git push` was rejected after a local catch-up — usually a PAT-scope issue; the PR is parked until the user intervenes).
+- Phase 5b shell-monitor events: `MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `BEHIND_RESOLVE_FAILED` (the monitor's `git push` was rejected after a local catch-up — usually a PAT-scope issue; the PR is parked until the user intervenes), `STALLED_GREEN` (the merge bot didn't fire after CI went green; the orchestrator is running the tier 2 / 3 / 4 ladder).
 - Phase 5b mini-agent terminal returns: `RESOLVED` (conflict-resolution), `FIXED` (CI-failure-fix), `ADDRESSED` (review-comment), `ENVIRONMENTAL` (CI-failure-fix flake/infra).
 - A new check `conclusion == "FAILURE"` newly observed in the rollup (the digest's `CI: red` count goes up).
 - A new merge conflict newly observed (`mergeStateStatus == "DIRTY"` newly seen — the digest's `merge: conflict` first appears).
@@ -772,6 +772,7 @@ pr="${1:?pr number required}"
 branch="${2:?pr branch required}"
 base="${3:-main}"
 poll="${POLL_INTERVAL:-45}"  # seconds between polls.
+stall_threshold="${STALL_THRESHOLD_SECONDS:-180}"  # first STALLED_GREEN emit.
 
 emit() { printf '%s\n' "$*"; }  # one event per line, line-buffered by default.
 
@@ -780,8 +781,21 @@ emit() { printf '%s\n' "$*"; }  # one event per line, line-buffered by default.
 seen_failures=""   # space-separated run IDs.
 seen_comments=""   # space-separated comment IDs.
 
+# Track "time since the PR's observable state last changed" so we can detect
+# the steady-state "green + automerge applied + open + mergeable" stall and
+# escalate it to the orchestrator rather than silently re-observing it every
+# poll. State hash is a stable digest of the JSON we already fetch — anything
+# the GitHub API surfaces as a change (new commit, label toggle, check
+# transition, mergeable flip) bumps the hash and resets the timer.
+last_change_ts=$(date +%s)
+prev_state_hash=""
+# Highest STALLED_GREEN threshold (seconds) we've already emitted for this
+# stall episode. Resets to "" on every state change so a fresh stall after a
+# transient flip starts the escalation ladder over from the bottom.
+emitted_stall_tier=""
+
 while :; do
-  state_json=$(gh pr view "$pr" --json state,url,mergeable,mergeStateStatus,statusCheckRollup,headRefOid 2>/dev/null || true)
+  state_json=$(gh pr view "$pr" --json state,url,mergeable,mergeStateStatus,statusCheckRollup,headRefOid,labels 2>/dev/null || true)
   if [[ -z "$state_json" ]]; then
     # Transient network blip — sleep and retry without crashing.
     sleep "$poll"; continue
@@ -791,6 +805,17 @@ while :; do
   url=$(jq -r '.url' <<<"$state_json")
   mergeable=$(jq -r '.mergeable' <<<"$state_json")
   msstatus=$(jq -r '.mergeStateStatus' <<<"$state_json")
+
+  # Bump last_change_ts whenever any observable PR state has changed since the
+  # previous tick. `del(.url)` drops the constant url field so it doesn't
+  # contribute to the hash; `tojson` with `-S` gives a sort-stable digest so
+  # equivalent JSON always hashes the same.
+  state_hash=$(jq -S 'del(.url) | tojson' <<<"$state_json" | sha1sum | cut -c1-8)
+  if [[ "$state_hash" != "$prev_state_hash" ]]; then
+    last_change_ts=$(date +%s)
+    prev_state_hash="$state_hash"
+    emitted_stall_tier=""
+  fi
 
   # ---- Terminal: PR merged. Emit and exit. ----
   if [[ "$state" == "MERGED" ]]; then
@@ -869,6 +894,44 @@ while :; do
                     | select((.body // "") | startswith("Claude") | not)'
   )
 
+  # ---- STALLED_GREEN: CI green + automerge applied + open + mergeable. ----
+  # The PR is in the steady state Tier 2/3/4 of the AUTOMERGE_SET-stall
+  # remediation ladder is designed for: nothing is broken, but the merge bot
+  # isn't firing. Emit once on first detection, then again at exponential
+  # intervals (3 min / 9 min / 18 min) so the orchestrator can run tier 2
+  # immediately and escalate to tier 3 / tier 4 only if the stall persists.
+  # Treat pending checks (null conclusion / IN_PROGRESS / QUEUED status) as
+  # NOT green — STALLED_GREEN is for "the rollup is fully resolved and the
+  # bot still isn't merging", not for "checks are still running".
+  green=$(jq -r '[.statusCheckRollup[]?
+                   | select((.conclusion // "") != "SUCCESS"
+                            and (.conclusion // "") != "SKIPPED"
+                            and (.conclusion // "") != "NEUTRAL")] | length == 0' \
+            <<<"$state_json")
+  has_automerge=$(jq -r '[.labels[]?.name] | any(. == "automerge")' <<<"$state_json")
+  is_open=$(jq -r '.state == "OPEN"' <<<"$state_json")
+  mergeable_ok=$(jq -r '.mergeable == "MERGEABLE"' <<<"$state_json")
+  age=$(( $(date +%s) - last_change_ts ))
+  if [[ "$green" == "true" && "$has_automerge" == "true" \
+        && "$is_open" == "true" && "$mergeable_ok" == "true" ]]; then
+    # Pick the highest threshold the current age has crossed but that we
+    # haven't already emitted for this stall episode. Thresholds derived from
+    # STALL_THRESHOLD_SECONDS (default 180s) at 1x / 3x / 6x — exponential
+    # backoff so the first emit is fast and re-emits get progressively rarer.
+    t1=$stall_threshold
+    t2=$((stall_threshold * 3))
+    t3=$((stall_threshold * 6))
+    next_tier=""
+    if   (( age >= t3 )) && [[ "$emitted_stall_tier" != "$t3" ]]; then next_tier=$t3
+    elif (( age >= t2 )) && [[ "$emitted_stall_tier" != "$t3" && "$emitted_stall_tier" != "$t2" ]]; then next_tier=$t2
+    elif (( age >= t1 )) && [[ -z "$emitted_stall_tier" ]]; then next_tier=$t1
+    fi
+    if [[ -n "$next_tier" ]]; then
+      emit "STALLED_GREEN $pr green-for=$age"
+      emitted_stall_tier=$next_tier
+    fi
+  fi
+
   sleep "$poll"
 done
 ```
@@ -880,6 +943,7 @@ Key behaviours:
 - **Transient `gh` failures** (network blips, rate-limit retries) don't crash the loop — `|| true` and an empty-result check keep polling.
 - **Deduplication** — failing run IDs and review comment IDs are tracked, so a persistent failure escalates exactly once per ID, not on every tick.
 - **`Claude` -prefixed comments are skipped** so the monitor doesn't re-escalate on the implementing agent's or reviewer subagent's own comments.
+- **Stall detection collapses the latency tail.** When the PR sits in (`mergeable == MERGEABLE`, all checks `SUCCESS`/`SKIPPED`/`NEUTRAL`, `automerge` label present, `state == OPEN`) for longer than `STALL_THRESHOLD_SECONDS` (default 180), the monitor emits `STALLED_GREEN <pr#> green-for=<seconds>`. The orchestrator routes the first emit to tier 2 of the AUTOMERGE_SET-stall ladder immediately rather than waiting for its next progress-tick wakeup (which can be ~270s away). Re-emits use exponential backoff (1x / 3x / 6x of the threshold — default 3 / 9 / 18 minutes) so a persistent stall escalates through tier 3 and tier 4 without spamming the orchestrator on every poll, and any state change (new commit, label flip, check transition) resets the timer so transient stalls don't accumulate. The threshold is configurable via the `STALL_THRESHOLD_SECONDS` env var when launching the monitor.
 
 > **Related, out of scope:** cloning the PR branch via SSH (`gh config set git_protocol ssh`) would sidestep PAT-scope issues for repo writes — SSH key auth doesn't enforce the `workflow` scope. Tracked as a separate consideration; the visibility fix above is the more general improvement, since silent push failures bite in lots of ways beyond the one scope issue.
 
@@ -896,6 +960,7 @@ The `Monitor` tool surfaces each stdout line of `monitor-pr.sh` as a notificatio
 | `CONFLICT <pr#> <branch> <base> <files>` | Dispatch the **conflict-resolution mini-agent** (template below). |
 | `CI_FAILURE <pr#> <check> <run-id>` | Size the fix first (see **CI-failure sizing rule** below). If ≤50 lines / 1-2 files, fix in-place at the orchestrator level. Otherwise dispatch the **CI-failure-fix mini-agent** (template below). |
 | `NEW_COMMENT <pr#> <comment-id>` | Dispatch the **review-comment mini-agent** (template below). |
+| `STALLED_GREEN <pr#> green-for=<s>` | Run the **AUTOMERGE_SET stall** ladder *now* rather than waiting for the next progress-tick wakeup. **First** `STALLED_GREEN` for a given PR → apply tier 2 immediately (toggle the merge-trigger label). **Second** `STALLED_GREEN` for the same PR (the monitor's exponential-backoff re-emit means tier 2 didn't take) → escalate to tier 3 (`workflow_dispatch` break-glass on the merge workflow). **Third** and beyond → tier 4 (probe the merge bot's run log) and surface the finding to the user. The shell monitor handles tier 1 (`BEHIND` auto-resolve) before this event ever fires, so a `STALLED_GREEN` always means the bot is the problem, not a stale base. See **Tiered remediation when AUTOMERGE_SET stalls** below for the per-tier mechanics. |
 
 #### CI-failure stale-aggregator short-circuit
 
@@ -919,6 +984,8 @@ When a dispatched mini-agent returns `RESOLVED` / `FIXED` / `ADDRESSED`, the she
 ### Tiered remediation when AUTOMERGE_SET stalls
 
 When a PR sits in `AUTOMERGE_SET` longer than ~5 minutes after CI rollup is fully green and the shell monitor's `green + waiting` no-op state has persisted, the merge bot has likely failed to fire (or fired and exited cleanly waiting for a re-trigger that never came). Work through these tiers **in order — don't loop on the early ones**. If a tier fails twice, escalate to the next; don't retry the same tier indefinitely.
+
+The trigger for entering this ladder is the shell monitor's `STALLED_GREEN <pr#> green-for=<s>` event (see the orchestrator event-routing table above) — the monitor emits it on the first poll where the steady state has held past `STALL_THRESHOLD_SECONDS` (default 180s) and re-emits at exponentially-spaced intervals while the stall persists. Each successive `STALLED_GREEN` for the same PR maps to the next tier in this list: first emit → tier 2, second → tier 3, third and beyond → tier 4. Don't wait for the next progress-tick wakeup to start tier 2 once a `STALLED_GREEN` arrives; the whole point of the event is to collapse that latency.
 
 1. **Tier 1 — `mergeStateStatus == "BEHIND"`.** Already automated by the Phase 5b shell monitor's in-shell auto-resolve (`git fetch origin <base> && git merge --no-edit origin/<base> && git push`); usually clears in ~30s on the next monitor tick. The orchestrator only steps in here if the shell monitor crashed — in which case relaunch the monitor first, and only fall back to running the same `git fetch / merge / push` by hand if the monitor still won't run. **Do not** reintroduce the `update-branch` API call; the local-merge approach is the contract.
 
