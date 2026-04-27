@@ -370,29 +370,24 @@ The 270s default is calibrated to the prompt-cache TTL (~5 min): it's the longes
 - Run drained (last PR merged) but two issues parked on user-input questions → **no wakeup**. The orchestrator awaits the user's reply; the next event is a user message, not a tick.
 - Mixed run: one implementing agent + one PR in `automerge_set` with CI in progress → **270s** (the in-progress-CI row matches before the agents-only row).
 
-**Per-issue probe** — for each in-flight issue `<N>`:
+**Per-issue probe** — for each in-flight issue `<N>`, invoke the digest-line script and emit its stdout verbatim:
 
-1. **Find the PR** (created in step 5 of the dispatch pipeline):
+```bash
+plugins/workflow/skills/implement/scripts/digest-line.sh <owner/repo> <N>
+```
 
-   ```bash
-   gh pr list --state all --search "Closes #<N> in:body" \
-     --json number,url,state,statusCheckRollup,mergeable,mergeStateStatus --limit 1
-   ```
+The script encodes the full mapping (PR lookup, review-comment counts, CI rollup aggregation, merge-state derivation, edge cases) and emits exactly one line on stdout per the format below. The orchestrator does **not** run gh queries inline or format the line itself — that work moved into the script so each tick costs ~one bash invocation per in-flight issue instead of ~500-1K tokens of inline JSON inference.
 
-   Use `--state all` (not `--state open`) so a PR that merged between ticks still appears with `state: MERGED` instead of dropping out of the result set — otherwise the empty-result branch is ambiguous between "no PR opened yet" and "PR merged".
+The script's exit code is always `0`; the orchestrator distinguishes outcomes via the output string. State mapping (preserved verbatim from the prior inline implementation):
 
-   - Empty result → no PR opened yet (agent hasn't pushed) → emit `#<N>: implementing` and skip the rest of the probe.
-   - `state == MERGED` → drop the issue from the in-flight set and emit a one-line `#<N> <pr-url> — merged` entry for this tick; skip the rest of the probe.
+1. **PR lookup** — `gh pr list --state all --search "Closes #<N> in:body" --json number,url,state,statusCheckRollup,mergeable,mergeStateStatus --limit 1`. `--state all` (not `--state open`) so a PR that merged between ticks still appears with `state: MERGED` instead of dropping out of the result set — otherwise the empty-result branch is ambiguous between "no PR opened yet" and "PR merged".
+
+   - Empty result → `#<N> — implementing` (drop the rest of the probe).
+   - `state == MERGED` → `#<N> <pr-url> — merged` (drop the issue from the in-flight set on subsequent ticks).
+   - `state == CLOSED` (without merge) → `#<N> <pr-url> — closed (not merged)` (drop the issue from the in-flight set on subsequent ticks).
    - `state == OPEN` → continue with the per-state formatting below.
 
-2. **Review status** — count `Claude Reviewer:` comments. The review subagent (step 6 of the dispatch pipeline) posts either inline review comments or a single LGTM PR-level comment with the `Claude Reviewer: ` prefix (the implementing agent uses `Claude: `, so the prefix discriminates):
-
-   ```bash
-   gh api 'repos/{owner}/{repo}/pulls/<pr#>/comments' \
-     --jq '[.[] | select(.body | startswith("Claude Reviewer: "))] | length'
-   gh api 'repos/{owner}/{repo}/issues/<pr#>/comments' \
-     --jq '[.[] | select(.body | startswith("Claude Reviewer: "))] | length'
-   ```
+2. **Review status** — count `Claude Reviewer:` comments via `gh api repos/<owner>/<repo>/pulls/<pr#>/comments` (inline) and `…/issues/<pr#>/comments` (PR-level). The review subagent (step 6 of the dispatch pipeline) posts either inline review comments or a single LGTM PR-level comment with the `Claude Reviewer: ` prefix (the implementing agent uses `Claude: `, so the prefix discriminates):
 
    - Both 0 → `review: pending`.
    - Inline count ≥ 1 → `review: done (<n> findings)`.
@@ -400,10 +395,10 @@ The 270s default is calibrated to the prompt-cache TTL (~5 min): it's the longes
 
 3. **CI state** — aggregate `statusCheckRollup` from the `gh pr list` query above:
 
-   - All entries `conclusion == "SUCCESS"` → `CI: green`.
+   - Rollup empty → `CI: not started`.
    - Any `conclusion == "FAILURE"` → `CI: red (<m> failing)`.
    - Any `status == "IN_PROGRESS"` or `"QUEUED"` → `CI: pending (<done>/<total>)`.
-   - Rollup empty → `CI: not started`.
+   - All entries `conclusion == "SUCCESS"` → `CI: green`.
 
 4. **Merge state** — `mergeable` + `mergeStateStatus` from the same `gh pr list` query (Phase 5b's shell monitor handles remediation for the non-clean cases — this signal just surfaces them to the user):
 
@@ -412,13 +407,13 @@ The 270s default is calibrated to the prompt-cache TTL (~5 min): it's the longes
    - `mergeable == "MERGEABLE"` (any non-conflicting `mergeStateStatus`) → `merge: clean`.
    - `mergeable == "UNKNOWN"` → `merge: computing`. GitHub hasn't finished computing mergeability yet; will resolve on the next tick.
 
-**Line format:**
+**Line format** (the script's stdout — emit verbatim):
 
 ```
 #<N> <pr-url> — review: <state> — CI: <state> — merge: <state>
 ```
 
-One line per in-flight issue. The MERGED-transition tick emits `#<N> <pr-url> — merged` once and the issue drops out of the in-flight set on subsequent ticks. Blocked / paused / errored issues drop out the same way — their terminal state is in the task list and is summarised in Phase 8's final report.
+One line per in-flight issue. The MERGED-transition tick emits `#<N> <pr-url> — merged` once and the issue drops out of the in-flight set on subsequent ticks. Blocked / paused / errored / closed-not-merged issues drop out the same way — their terminal state is in the task list and is summarised in Phase 8's final report. **If either the line format or the state mapping changes, update `scripts/digest-line.sh` in lockstep — they are a single contract.**
 
 Example tick output:
 
@@ -428,6 +423,7 @@ Example tick output:
 #339 https://github.com/aidanns/agent-auth/pull/452 — review: pending — CI: red (1 failing) — merge: conflict
 #340 — implementing
 #341 https://github.com/aidanns/agent-auth/pull/453 — merged
+#342 https://github.com/aidanns/agent-auth/pull/454 — closed (not merged)
 ```
 
 #### Notification-relay policy
