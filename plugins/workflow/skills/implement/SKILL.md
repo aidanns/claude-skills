@@ -363,9 +363,33 @@ The TaskCreate list (Phase 4) is the durable surface. Augment it with a chat-vis
 
 **Cadence:**
 
-- On every orchestrator wakeup tick (~270s) while at least one issue is in-flight (`in-progress` or `automerge_set`). Schedule a recurring `ScheduleWakeup(delaySeconds: 270)` whenever the in-flight count > 0 and no wakeup is already pending.
+- Emit a digest on every orchestrator wakeup tick while at least one issue is in-flight (`in-progress` or `automerge_set`). The next-wakeup interval is **state-based** rather than fixed — see the table below.
 - Immediately on every dispatched-agent terminal return (`MERGED`, `AUTOMERGE_SET`, `BLOCKED`, `PAUSED`, `ERRORED`) — emit a digest of the remaining in-flight set so the user sees the new state without waiting for the next tick.
-- Immediately on every Phase 5b monitor event (`MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, mini-agent `RESOLVED` / `FIXED` / `ADDRESSED`) — same digest line so the user sees what the shell monitor and its mini-agents are doing.
+- Immediately on every Phase 5b monitor event (`MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `STALLED_GREEN`, mini-agent `RESOLVED` / `FIXED` / `ADDRESSED`) — same digest line so the user sees what the shell monitor and its mini-agents are doing.
+
+**State-based wakeup interval:**
+
+At the **end of each tick** (after the digest is emitted and any state transitions have been processed), choose the next-wakeup interval by walking the table below top-to-bottom and taking the first matching row. Then call `ScheduleWakeup(delaySeconds: <interval>)` (or skip the call entirely for the no-wakeup row). Cancel any previously-pending wakeup before scheduling the new one so only one is outstanding at a time.
+
+The 270s default is calibrated to the prompt-cache TTL (~5 min): it's the longest interval that still gets a cache hit on the next tick. Shorter intervals (60–90s) pay a guaranteed cache hit too (well inside the TTL) and are used when a near-term state transition is genuinely expected. Longer intervals (600s) and the no-wakeup case accept a cache miss on the next tick because there's no signal to poll for in the meantime — the orchestrator wakes on agent-termination or shell-monitor events instead.
+
+| Run state                                                                                    | Next interval | Why                                                                                                                                  |
+| -------------------------------------------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Any PR in `automerge_set` with CI fully green (all checks `SUCCESS`/`SKIPPED`/`NEUTRAL`) and `mergeable == "MERGEABLE"`, awaiting the merge bot to fire | **90s**       | The `MERGED` transition is imminent (seconds-to-a-minute once the bot fires). A short interval catches it before a 270s tick would. |
+| Any PR in tiered-remediation flow after a `STALLED_GREEN` emit (tier 2/3/4 in-flight)        | **60s**       | A label-flip or `workflow_dispatch` break-glass should produce a near-term state change; fast follow-up confirms it took.            |
+| Any PR in `automerge_set` with CI still in progress (any check `IN_PROGRESS`/`QUEUED`)       | **270s**      | CI runs take 5–10 min; 270s is the cache-TTL-aligned default and there's nothing to gain from polling faster.                        |
+| Only implementing agents in flight (no PRs in `automerge_set` yet)                            | **600s**      | The orchestrator gets notified directly on agent termination; per-tick polling adds no value, so widen the interval and accept a cache miss. |
+| Run drained (in-flight count == 0) but parked questions outstanding awaiting user input      | **none**      | Skip the `ScheduleWakeup` call entirely. The orchestrator awaits the user's reply; nothing else will change state.                   |
+| Default (mixed in-flight, none of the above special cases)                                    | **270s**      | Cache-TTL-aligned baseline.                                                                                                          |
+
+**Examples — predicting the cadence from a run shape:**
+
+- One PR in `automerge_set`, CI green, awaiting the GitHub merge bot → **90s**. (See `STALLED_GREEN` in Phase 5b — if the bot fails to fire within `STALL_THRESHOLD_SECONDS` of green, the monitor escalates; the 90s interval surfaces the `MERGED` transition before that threshold even matters.)
+- One PR in `automerge_set` with `STALLED_GREEN` having fired and tier 2 (label-flip) just dispatched → **60s**. The next tick checks whether the label-flip nudged the bot into firing.
+- Two PRs in `automerge_set`, one with CI green and one with CI in progress → **90s** (the green-and-merge-pending row matches first; the in-progress PR will be re-checked on the same tick).
+- Three implementing agents in flight, no PRs opened yet → **600s**. The orchestrator wakes on each agent's terminal return; polling at 270s would just re-emit `#<N>: implementing` lines until the first PR appears.
+- Run drained (last PR merged) but two issues parked on user-input questions → **no wakeup**. The orchestrator awaits the user's reply; the next event is a user message, not a tick.
+- Mixed run: one implementing agent + one PR in `automerge_set` with CI in progress → **270s** (the in-progress-CI row matches before the agents-only row).
 
 **Per-issue probe** — for each in-flight issue `<N>`:
 
@@ -944,7 +968,7 @@ Key behaviours:
 - **Transient `gh` failures** (network blips, rate-limit retries) don't crash the loop — `|| true` and an empty-result check keep polling.
 - **Deduplication** — failing run IDs and review comment IDs are tracked, so a persistent failure escalates exactly once per ID, not on every tick.
 - **`Claude` -prefixed comments are skipped** so the monitor doesn't re-escalate on the implementing agent's or reviewer subagent's own comments.
-- **Stall detection collapses the latency tail.** When the PR sits in (`mergeable == MERGEABLE`, all checks `SUCCESS`/`SKIPPED`/`NEUTRAL`, `automerge` label present, `state == OPEN`) for longer than `STALL_THRESHOLD_SECONDS` (default 180), the monitor emits `STALLED_GREEN <pr#> green-for=<seconds>`. The orchestrator routes the first emit to tier 2 of the AUTOMERGE_SET-stall ladder immediately rather than waiting for its next progress-tick wakeup (which can be ~270s away). Re-emits use exponential backoff (1x / 3x / 6x of the threshold — default 3 / 9 / 18 minutes) so a persistent stall escalates through tier 3 and tier 4 without spamming the orchestrator on every poll, and any state change (new commit, label flip, check transition) resets the timer so transient stalls don't accumulate. The threshold is configurable via the `STALL_THRESHOLD_SECONDS` env var when launching the monitor.
+- **Stall detection collapses the latency tail.** When the PR sits in (`mergeable == MERGEABLE`, all checks `SUCCESS`/`SKIPPED`/`NEUTRAL`, `automerge` label present, `state == OPEN`) for longer than `STALL_THRESHOLD_SECONDS` (default 180), the monitor emits `STALLED_GREEN <pr#> green-for=<seconds>`. The orchestrator routes the first emit to tier 2 of the AUTOMERGE_SET-stall ladder immediately rather than waiting for its next progress-tick wakeup (which can be up to the current state-based interval away — see Phase 5 § Progress reporting § State-based wakeup interval). Re-emits use exponential backoff (1x / 3x / 6x of the threshold — default 3 / 9 / 18 minutes) so a persistent stall escalates through tier 3 and tier 4 without spamming the orchestrator on every poll, and any state change (new commit, label flip, check transition) resets the timer so transient stalls don't accumulate. The threshold is configurable via the `STALL_THRESHOLD_SECONDS` env var when launching the monitor.
 
 > **Related, out of scope:** cloning the PR branch via SSH (`gh config set git_protocol ssh`) would sidestep PAT-scope issues for repo writes — SSH key auth doesn't enforce the `workflow` scope. Tracked as a separate consideration; the visibility fix above is the more general improvement, since silent push failures bite in lots of ways beyond the one scope issue.
 
