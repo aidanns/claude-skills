@@ -1,6 +1,6 @@
 ---
 name: implement
-description: Process one or more GitHub issues end-to-end through implementation and merge. Triggered by /workflow:implement with optional args (issue numbers, --label, --milestone, --parent). Self-contained orchestration — embeds the full work pipeline (worktree, plan, PR, self-review, code-review subagent, CI babysitting, automerge) so it works without project-specific CLAUDE.md scaffolding. Defaults: 3 concurrent agents, park-and-continue on blockers, sequential dependency-aware execution.
+description: Process one or more GitHub issues end-to-end. Triggered by /workflow:implement with optional args (issue numbers, --label, --milestone, --parent). The implementing agent runs in an isolated worktree (worktree → plan → PR → self-review → `READY_FOR_REVIEW`); the orchestrator owns review, address-review, CI fix-up, automerge handoff, and post-merge monitoring. Self-contained — embeds the full pipeline in dispatched-agent prompts so it works without project-specific CLAUDE.md scaffolding. Defaults: 3 concurrent implementing agents, park-and-continue on blockers, sequential dependency-aware execution.
 ---
 
 # implement
