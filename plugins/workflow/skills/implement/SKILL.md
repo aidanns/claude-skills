@@ -587,7 +587,7 @@ The script's exit code is always `0`; the orchestrator distinguishes outcomes vi
 
    - Both 0 → `review: pending`.
    - Inline count ≥ 1 → `review: done (<n> findings)`.
-   - Inline 0 and exactly one issue-level comment matching `Claude Reviewer: LGTM` → `review: done (LGTM)`.
+   - Inline 0 and exactly one `Claude Reviewer: LGTM` issue-level comment, regardless of how many other PR-level comments exist (the implementing agent posts its own `Claude: ` notes — e.g. environmental-CI retries — and gating on the total PR-level count would suppress this branch whenever such a note exists) → `review: done (LGTM)`.
 
 3. **CI state** — aggregate `statusCheckRollup` from the `gh pr list` query above:
 

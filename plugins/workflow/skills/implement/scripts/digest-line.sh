@@ -58,13 +58,22 @@ esac
 # --- Review status ---------------------------------------------------------
 #
 # Count `Claude Reviewer:` comments — inline (per-line review comments) and
-# issue-level (PR-level comments). The review subagent posts either inline
-# findings or a single `Claude Reviewer: LGTM` PR-level comment; the
-# implementing agent uses `Claude:`, so the prefix discriminates.
+# the LGTM PR-level comment. The review subagent posts either inline findings
+# or a single `Claude Reviewer: LGTM` PR-level comment; the implementing
+# agent uses `Claude:`, so the prefix discriminates.
+#
+# We do *not* gate the LGTM branch on a total-PR-level-comment count: the
+# implementing agent legitimately posts its own `Claude:` PR-level comments
+# (e.g. "CI failure was environmental, retrying" per the dispatch template's
+# 6.3 rules), and a stricter "exactly one PR-level comment overall" check
+# would suppress `done (LGTM)` whenever any such note exists. The `lgtm_count`
+# query already filters by the `Claude Reviewer: LGTM` prefix, which is
+# sufficient on its own.
+#
+# Test case: implementing agent posts one `Claude: ...` PR-level comment AND
+# the review subagent posts `Claude Reviewer: LGTM. <summary>`. Then
+# inline_count == 0, lgtm_count == 1, and the digest emits `done (LGTM)`.
 inline_count=$(gh api "repos/${repo}/pulls/${pr_number}/comments" \
-  --jq '[.[] | select(.body | startswith("Claude Reviewer: "))] | length' \
-  2>/dev/null || echo 0)
-issue_count=$(gh api "repos/${repo}/issues/${pr_number}/comments" \
   --jq '[.[] | select(.body | startswith("Claude Reviewer: "))] | length' \
   2>/dev/null || echo 0)
 lgtm_count=$(gh api "repos/${repo}/issues/${pr_number}/comments" \
@@ -73,7 +82,7 @@ lgtm_count=$(gh api "repos/${repo}/issues/${pr_number}/comments" \
 
 if (( inline_count >= 1 )); then
   review_state="done (${inline_count} findings)"
-elif (( inline_count == 0 )) && (( lgtm_count == 1 )) && (( issue_count == 1 )); then
+elif (( inline_count == 0 )) && (( lgtm_count == 1 )); then
   review_state="done (LGTM)"
 else
   review_state="pending"
