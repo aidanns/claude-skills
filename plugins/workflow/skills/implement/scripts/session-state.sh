@@ -25,8 +25,13 @@
 #   update-issue <id> <issue#> <new-state> [<key=value> ...]
 #       Update the per-issue terminal state and any dispatch-context fields
 #       (branch, worktree, pr_number, pr_url, blocked_question, paused_reason,
-#       errored_reason). Keys outside that allow-list are rejected so the
-#       schema stays disciplined.
+#       errored_reason, body_snapshot, labels_snapshot). Keys outside that
+#       allow-list are rejected so the schema stays disciplined.
+#       <new-state> must be one of: scheduled, in-progress, automerge_set,
+#       merged, blocked, paused, errored, externally_closed. (externally_closed
+#       is the terminal outcome the parked-issue poll uses when an issue is
+#       closed externally while in `blocked` — it qualifies for Phase 8
+#       garbage collection alongside merged/errored.)
 #
 #   append-digest <id> <digest-line>
 #       Append <digest-line> to the progress-digest tail. The tail is capped
@@ -118,7 +123,9 @@ cmd_init() {
                     pr_url: null,
                     blocked_question: null,
                     paused_reason: null,
-                    errored_reason: null
+                    errored_reason: null,
+                    body_snapshot: null,
+                    labels_snapshot: null
                   })
                 | map({(.number | tostring): .})
                 | add // {}),
@@ -145,6 +152,14 @@ cmd_update_issue() {
   local id="${1:?id required}" issue="${2:?issue# required}" new_state="${3:?new state required}"
   shift 3
 
+  case "$new_state" in
+    scheduled|in-progress|automerge_set|merged|blocked|paused|errored|externally_closed) ;;
+    *)
+      printf 'session-state: rejected state %q (allowed: scheduled in-progress automerge_set merged blocked paused errored externally_closed)\n' "$new_state" >&2
+      exit 2
+      ;;
+  esac
+
   local path
   path=$(state_path "$id")
   require_file "$path"
@@ -161,9 +176,9 @@ cmd_update_issue() {
     key="${kv%%=*}"
     value="${kv#*=}"
     case "$key" in
-      branch|worktree|pr_number|pr_url|blocked_question|paused_reason|errored_reason) ;;
+      branch|worktree|pr_number|pr_url|blocked_question|paused_reason|errored_reason|body_snapshot|labels_snapshot) ;;
       *)
-        printf 'session-state: rejected key %q (allowed: branch worktree pr_number pr_url blocked_question paused_reason errored_reason)\n' "$key" >&2
+        printf 'session-state: rejected key %q (allowed: branch worktree pr_number pr_url blocked_question paused_reason errored_reason body_snapshot labels_snapshot)\n' "$key" >&2
         exit 2
         ;;
     esac
@@ -218,13 +233,13 @@ cmd_list() {
     mtime=$(date -u -r "$f" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
             || stat -c '%y' "$f" | cut -d. -f1)
     # Single jq invocation per file. "in-flight" = anything not
-    # fully-resolved (i.e. not merged / errored).
+    # fully-resolved (i.e. not merged / errored / externally_closed).
     jq -r --arg mtime "$mtime" '
       [.session_id,
        .repo,
        $mtime,
        (.selector | to_entries | map("\(.key)=\(.value)") | join(" ")),
-       "in-flight=" + (([.issues[] | select(.state != "merged" and .state != "errored")] | length) | tostring)
+       "in-flight=" + (([.issues[] | select(.state != "merged" and .state != "errored" and .state != "externally_closed")] | length) | tostring)
       ] | @tsv
     ' "$f"
   done
