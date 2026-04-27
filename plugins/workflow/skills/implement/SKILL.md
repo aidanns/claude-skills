@@ -73,7 +73,7 @@ If a label doesn't exist in the repo, create it once via `gh label create` (see 
 
 ### CI discipline
 
-- Read failure logs before acting (`gh run view <run-id> --log-failed`).
+- Read failure logs before acting (`bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/triage-ci-failure.sh" <repo> <run-id>` — emits a focused ~30-line summary; see Phase 5 § 6.3).
 - Fix the root cause; don't pin around it, disable the check, or retry blindly.
 - Environmental / flaky failures (infra outage, rate limit, unrelated to this PR's diff) get reported but not retried — surface the issue rather than re-running.
 
@@ -586,7 +586,11 @@ Fetch PR status:
 
 For each entry with `conclusion == "FAILURE"`:
 
-1. Get logs: `gh run view <databaseId> --log-failed`.
+1. Get a focused failure summary:
+
+       bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/triage-ci-failure.sh" <owner/repo> <databaseId>
+
+   The script emits ~30 lines: the failing step's name, up to 10 deduplicated error-marker lines (`error:|::error::|^FAILED|Traceback|assertion|FAIL\b`, case-insensitive), and the last 10 lines of the failing step's output. This replaces piping `gh run view <databaseId> --log-failed` through ad-hoc `tail`/`head`/grep — the actual error is guaranteed to be in scope and ~3-5K tokens of unrelated log noise are skipped per investigation. If the output is empty (green-but-failed run, log unattached, API quirk), fall back to `gh run view <databaseId>` without `--log-failed` for the high-level summary.
 2. Diagnose root cause. Do NOT bypass the check.
 3. Fix; commit with a conventional-commit message referencing the failing check.
 4. `git pull --rebase` + `git push`.
@@ -968,7 +972,7 @@ The `gh api repos/.../code-scanning/alerts` endpoint requires `security_events` 
 
 #### CI-failure sizing rule
 
-On a `CI_FAILURE` event during the wait-for-merge tail, investigate before dispatching: `gh run view <run-id> --log-failed`, find root cause, don't bypass. Then size the fix:
+On a `CI_FAILURE` event during the wait-for-merge tail, investigate before dispatching: `bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/triage-ci-failure.sh" <repo> <run-id>` (focused ~30-line summary — see Phase 5 § 6.3 for the contract), find root cause, don't bypass. Then size the fix:
 
 - **≤50-line fix in 1-2 files** (typecheck error, lint violation, missing import, sub-block in same file): **fix in place at the orchestrator level.** Do not pay the mini-agent cold-load. Use the existing branch — the implementing agent's worktree may still exist on disk at `.claude/worktrees/agent-<id>` and is reusable; otherwise check out the branch into a fresh worktree. Commit, push, let CI re-fire. The implementing agent is gone but the branch and PR are still yours.
 - **Larger fix, multi-file refactor, or new test surface required**: dispatch the CI-failure-fix mini-agent (template below). Pays a cold-load but safer for non-trivial changes.
@@ -1051,7 +1055,11 @@ If the failing check matches one of these, follow the documented workaround inst
 
 Pipeline:
 
-1. Read the failure logs: `gh run view <run-id> --log-failed`.
+1. Read a focused failure summary:
+
+       bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/triage-ci-failure.sh" <repo> <run-id>
+
+   The script emits ~30 lines: failing step name, deduplicated error markers (top 10), and the last 10 lines of the failing step. This replaces the prior `gh run view <run-id> --log-failed` slicing — the actual error is guaranteed to be in scope and ~3-5K tokens of unrelated log noise are skipped. Empty output is a signal in itself (log unattached / green-but-failed run / API quirk) — fall back to `gh run view <run-id>` without `--log-failed` for the high-level summary, or treat the failure as `ENVIRONMENTAL` if the run-level metadata also looks degenerate.
 2. Diagnose the root cause. Do NOT bypass the check, disable it, or retry blindly.
 3. **A check passing 'success' isn't the same as the check doing its job.** If the failing check depends on an upstream artifact (e.g. `changelog-lint` failing because no `pr-<N>-*.yml` exists), look at the upstream workflow's logs for `secrets not configured`-style notices before concluding it's a real failure.
 4. Fix the root cause. Commit with a conventional-commits message referencing the failing check (e.g. `fix(ci): correct lint config for <check>`).
