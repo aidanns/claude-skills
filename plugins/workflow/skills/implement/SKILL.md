@@ -118,7 +118,7 @@ Two paths, mutually exclusive:
   bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" get <id>
   ```
 
-  If the file is missing, **bail out hard** — see § Bail-outs. Do not auto-create. On success, the file contains everything Phase 1 / Phase 2 / Phase 3 would otherwise re-derive: selector args, resolved issue list, dep graph, per-issue terminal state, and the progress-digest tail. Skip the issue-list resolution, the Phase 2 clarification batch (already-confirmed clarifications were applied to issue bodies on the original run), and the Phase 3 dep-analysis pass (deps were declared and persisted). Re-enter the pipeline at Phase 4 — but **only to apply labels and create TaskList tasks for issues whose persisted state is `scheduled` or `in-progress`**; merged / blocked / paused / errored issues keep their existing state and are surfaced in the next progress digest. Phase 5 step 0 (per-issue resumption check) then runs as normal for every non-terminal issue.
+  If the file is missing, **bail out hard** — see § Bail-outs. Do not auto-create. On success, the file contains everything Phase 1 / Phase 2 / Phase 3 would otherwise re-derive: selector args, resolved issue list, dep graph, per-issue terminal state, and the progress-digest tail. Skip the issue-list resolution, the Phase 2 clarification batch (already-confirmed clarifications were applied to issue bodies on the original run), and the Phase 3 dep-analysis pass (deps were declared and persisted). Re-enter the pipeline at Phase 4 — but **only to apply labels and create TaskList tasks for issues whose persisted state is `scheduled` or `in-progress`**; merged / blocked / paused / errored / externally_closed issues keep their existing state and are surfaced in the next progress digest. Phase 5 step 0 (per-issue resumption check) then runs as normal for every non-terminal issue.
 
   Log the resumed session ID once, chat-visible, with a one-line summary so the user can confirm:
 
@@ -215,7 +215,9 @@ Per-user (not per-project) so a user with multiple repo checkouts under `~/Proje
       "pr_url": "https://github.com/aidanns/claude-skills/pull/91",
       "blocked_question": null,
       "paused_reason": null,
-      "errored_reason": null
+      "errored_reason": null,
+      "body_snapshot": null,
+      "labels_snapshot": null
     },
     "282": {"number": 282, "state": "in-progress", "branch": "aidanns/bar", "worktree": "...", "pr_number": null, "pr_url": null, "...": null},
     "283": {"number": 283, "state": "scheduled", "...": null}
@@ -232,9 +234,10 @@ Per-issue `state` field — terminal token from the orchestrator's perspective:
 - `in-progress` — agent dispatched (Phase 5 step 4), PR may or may not be open yet.
 - `automerge_set` — orchestrator set automerge after review completed (Phase 5 step 5). Phase 5b's shell monitor is now driving the PR to merge.
 - `merged` — Phase 5b shell monitor emitted `MERGED`; Phase 6 housekeeping is done or in progress.
-- `blocked` — agent returned `BLOCKED <question>` (Phase 7). `blocked_question` carries the parked question.
+- `blocked` — agent returned `BLOCKED <question>` (Phase 7). `blocked_question` carries the parked question. The `body_snapshot` and `labels_snapshot` fields are populated at this transition (used by the parked-issue poll — see § Progress reporting § Parked-issue poll).
 - `paused` — agent returned `PAUSED <reason>` (Phase 5 step 5 PAUSED branch). `paused_reason` carries the pause cause.
 - `errored` — agent returned `ERRORED <error>`. `errored_reason` carries the error string.
+- `externally_closed` — the parked-issue poll observed `state == CLOSED` on GitHub (issue closed externally — duplicate, no-repro, etc.) while the issue was `blocked`. Terminal; treated as fully-resolved for Phase 8 garbage collection (the issue is gone — re-dispatch would produce orphan work).
 
 The `digest_tail` keeps the last 50 progress-digest lines so a `--resume` reattachment can show the user where the run was last time without re-polling GitHub.
 
@@ -253,7 +256,7 @@ Subcommands:
 | `init <id> <repo> <selector-json> <issues-json> [<deps-json>]` | Phase 3 → create the state file from the resolved issue list. Per-issue state defaults to `scheduled` and dispatch-context fields default to `null`. |
 | `get <id>` | Phase 1 (`--resume`) → print the state file, or exit 1 if missing. |
 | `path <id>` | Print the absolute path (whether or not the file exists). |
-| `update-issue <id> <issue#> <new-state> [<key=value> ...]` | Phase 5 / Phase 6 → flip per-issue state and patch dispatch-context fields. Allow-listed keys: `branch`, `worktree`, `pr_number`, `pr_url`, `blocked_question`, `paused_reason`, `errored_reason`. |
+| `update-issue <id> <issue#> <new-state> [<key=value> ...]` | Phase 5 / Phase 6 → flip per-issue state and patch dispatch-context fields. Allow-listed keys: `branch`, `worktree`, `pr_number`, `pr_url`, `blocked_question`, `paused_reason`, `errored_reason`, `body_snapshot`, `labels_snapshot`. Allow-listed `<new-state>` values: `scheduled`, `in-progress`, `automerge_set`, `merged`, `blocked`, `paused`, `errored`, `externally_closed`. |
 | `append-digest <id> <line>` | Phase 5 progress reporting → append a digest line to `digest_tail` (capped at 50 entries). |
 | `list` | `--session list` → enumerate every state file with ID, repo, last-modified timestamp, selector summary, in-flight count. |
 | `delete <id>` | Phase 8 → remove the state file once every issue is terminal. |
@@ -262,7 +265,7 @@ The script keeps all JSON manipulation inside `jq`; the orchestrator should not 
 
 ### Garbage collection
 
-The state file is deleted in Phase 8 once every issue is **fully resolved** — `merged` or `errored`. `blocked` and `paused` do not count as fully resolved (the user is expected to come back via `--resume <id>`); see Phase 8.1 for the rule. A leftover file means a run aborted before reaching Phase 8 *or* parked on user input; `--session list` will surface it and the user can `--resume <id>` or manually clear it. A future `--session forget <id>` flag could expose the `delete` subcommand directly for explicit cleanup, but until then `rm ~/.claude/state/workflow-implement/<id>.json` is the manual escape hatch.
+The state file is deleted in Phase 8 once every issue is **fully resolved** — `merged`, `errored`, or `externally_closed`. `blocked` and `paused` do not count as fully resolved (the user is expected to come back via `--resume <id>`); see Phase 8.1 for the rule. The `externally_closed` outcome is terminal in the same sense `merged` is — the issue is gone, no further orchestrator action is possible — so it qualifies for GC alongside `merged`/`errored` (otherwise an externally-closed issue would orphan the state file). A leftover file means a run aborted before reaching Phase 8 *or* parked on user input; `--session list` will surface it and the user can `--resume <id>` or manually clear it. A future `--session forget <id>` flag could expose the `delete` subcommand directly for explicit cleanup, but until then `rm ~/.claude/state/workflow-implement/<id>.json` is the manual escape hatch.
 
 ### Layering with Phase 5 step 0
 
@@ -452,7 +455,7 @@ Loop until every issue is terminal (merged, parked, or excluded):
 
    Each transition is an orchestrator action, parsed from a literal terminal token in the agent's `result` field. The implementing agent never sets automerge; the orchestrator does, after review (and address-review, if findings landed).
 
-   **State-file persistence on every transition.** Every state change below — `dispatch` (in-progress), `automerge_set`, `merged`, `blocked`, `paused`, `errored` — is mirrored into the session state file via the helper script *as part of the same orchestrator step that fires the transition*. This is what makes `--resume` viable: the file is the durable record of where the run is. Concretely:
+   **State-file persistence on every transition.** Every state change below — `dispatch` (in-progress), `automerge_set`, `merged`, `blocked`, `paused`, `errored`, `externally_closed` — is mirrored into the session state file via the helper script *as part of the same orchestrator step that fires the transition*. This is what makes `--resume` viable: the file is the durable record of where the run is. Concretely:
 
    ```bash
    bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" update-issue \
@@ -463,9 +466,10 @@ Loop until every issue is terminal (merged, parked, or excluded):
    - On the implementing agent's `READY_FOR_REVIEW` return: `update-issue <id> <n> in-progress pr_number=<p> pr_url=<u>` (state stays `in-progress`; only the dispatch context advances).
    - On automerge set (LGTM or `READY_TO_MERGE` branch): `update-issue <id> <n> automerge_set`.
    - On the Phase 5b shell monitor's `MERGED` event: `update-issue <id> <n> merged` (Phase 6 housekeeping then runs).
-   - On `BLOCKED`: `update-issue <id> <n> blocked blocked_question="<question>"`.
+   - On `BLOCKED`: `update-issue <id> <n> blocked blocked_question="<question>" body_snapshot="<issue body>" labels_snapshot="<comma-joined sorted labels>"`. The `body_snapshot` / `labels_snapshot` fields seed the parked-issue poll (see § Progress reporting § Parked-issue poll § Snapshot persistence) so the first post-park tick has something to compare against — and so a `/clear` + `--resume <id>` reattachment doesn't lose the comparison baseline.
    - On `PAUSED`: `update-issue <id> <n> paused paused_reason="<reason>"`.
    - On `ERRORED`: `update-issue <id> <n> errored errored_reason="<error>"`.
+   - On `externally_closed` (parked-issue poll observed `state == CLOSED`): `update-issue <id> <n> externally_closed`. No further state-file fields are required — the existing `blocked_question` survives in the file as the audit trail of what the issue had been parked on before it was closed externally.
 
    Treat the state-file write as part of the transition, not a follow-up: a Claude Code crash *between* the transition and the file write would leave the orchestrator and the file out of sync, which is the exact failure mode `--resume` is meant to prevent.
 
@@ -553,7 +557,7 @@ The 270s default is calibrated to the prompt-cache TTL (~5 min): it's the longes
 | Any PR in tiered-remediation flow after a `STALLED_GREEN` emit (tier 2/3/4 in-flight)        | **60s**       | A label-flip or `workflow_dispatch` break-glass should produce a near-term state change; fast follow-up confirms it took.            |
 | Any PR in `automerge_set` with CI still in progress (any check `IN_PROGRESS`/`QUEUED`)       | **270s**      | CI runs take 5–10 min; 270s is the cache-TTL-aligned default and there's nothing to gain from polling faster.                        |
 | Only implementing agents in flight (no PRs in `automerge_set` yet)                            | **600s**      | The orchestrator gets notified directly on agent termination; per-tick polling adds no value, so widen the interval and accept a cache miss. |
-| Run drained (in-flight count == 0) but parked questions outstanding awaiting user input      | **3600s**     | Long-interval fallback so the orchestrator notices out-of-band changes to a parked issue (label removed, body edited, issue closed externally) without requiring the user to re-invoke the skill. Each tick runs the parked-issue poll (see § Parked-issue poll below). The user can opt out with "stop polling, I'll re-invoke explicitly when ready" — the orchestrator then skips the `ScheduleWakeup` call entirely and reverts to the original "no wakeup" behaviour. |
+| Run drained (in-flight count == 0) but at least one issue parked **on a clarification question** (`state == "blocked"`) awaiting user input | **3600s**     | Long-interval fallback so the orchestrator notices out-of-band changes to a `blocked` issue (label removed, body edited, issue closed externally) without requiring the user to re-invoke the skill. Each tick runs the parked-issue poll (see § Parked-issue poll below). `paused` issues do not match this row — `paused` is a wall-clock wait on an environmental condition (rate-limit / cap), recovered by the Phase 5 step 5 PAUSED branch's resumption-agent re-dispatch, not by polling GitHub for body / label / state changes. A run with only `paused` issues and no `blocked` issues falls through to the next-matching row (typically the implementing-only or default row). The user can opt out of the parked-issue poll with "stop polling, I'll re-invoke explicitly when ready" — the orchestrator then skips the `ScheduleWakeup` call entirely and reverts to the original "no wakeup" behaviour. |
 | Default (mixed in-flight, none of the above special cases)                                    | **270s**      | Cache-TTL-aligned baseline.                                                                                                          |
 
 **Examples — predicting the cadence from a run shape:**
@@ -562,13 +566,13 @@ The 270s default is calibrated to the prompt-cache TTL (~5 min): it's the longes
 - One PR in `automerge_set` with `STALLED_GREEN` having fired and tier 2 (label-flip) just dispatched → **60s**. The next tick checks whether the label-flip nudged the bot into firing.
 - Two PRs in `automerge_set`, one with CI green and one with CI in progress → **90s** (the green-and-merge-pending row matches first; the in-progress PR will be re-checked on the same tick).
 - Three implementing agents in flight, no PRs opened yet → **600s**. The orchestrator wakes on each agent's terminal return; polling at 270s would just re-emit `#<N>: implementing` lines until the first PR appears.
-- Run drained (last PR merged) but two issues parked on user-input questions → **3600s**. Each tick polls each parked issue's `state`/`body`/`labels` (see § Parked-issue poll below); a label flip, body edit, or external close re-enters Phase 5 for the affected issue.
+- Run drained (last PR merged) but two issues `blocked` on user-input questions → **3600s**. Each tick polls each `blocked` issue's `state`/`body`/`labels` (see § Parked-issue poll below); a label flip, body edit, or external close re-enters Phase 5 for the affected issue. `paused` issues are not polled by this row — they're handled by the PAUSED-branch resumption-agent re-dispatch.
 - Same run shape as above but the user explicitly said "stop polling, I'll re-invoke explicitly when ready" → **no wakeup**. The orchestrator skips `ScheduleWakeup` and awaits a user message; the parked-issue poll does not run.
 - Mixed run: one implementing agent + one PR in `automerge_set` with CI in progress → **270s** (the in-progress-CI row matches before the agents-only row).
 
 **Parked-issue poll:**
 
-When the all-parked row matches and the user has not opted out of polling, the 3600s wakeup tick runs a lightweight check against each parked issue's GitHub state. Without it, an orchestrator that drained to all-parked is dead-on-arrival: someone (or another tool) editing the issue body, removing the `blocked` label, or closing the issue externally would never reach the run, and the user would have to remember to `--resume <id>` themselves.
+When the all-parked row matches and the user has not opted out of polling, the 3600s wakeup tick runs a lightweight check against each `blocked` issue's GitHub state. Without it, an orchestrator that drained to all-`blocked` is dead-on-arrival: someone (or another tool) editing the issue body, removing the `blocked` label, or closing the issue externally would never reach the run, and the user would have to remember to `--resume <id>` themselves.
 
 What it queries — for each issue in `state == "blocked"`:
 
@@ -576,20 +580,34 @@ What it queries — for each issue in `state == "blocked"`:
 gh issue view <N> --json state,body,labels
 ```
 
-What counts as "changed" (any one of the following, compared against the snapshot taken when the issue was parked):
+**Snapshot persistence.** The poll's change-detection compares against `body_snapshot` and `labels_snapshot` fields persisted on the per-issue record in the session state file (allow-listed in `update-issue`). The snapshot is captured at the BLOCKED transition (Phase 5 step 5's BLOCKED branch — alongside the `blocked_question` write) and refreshed on every poll tick after the comparison. This makes the poll durable across `/clear` + `--resume <id>`: a resumed session reads the snapshot back from the state file and the next poll tick compares against it instead of either firing spuriously (snapshot empty ⇒ first-poll fallback) or skipping comparison entirely.
+
+Concretely, the BLOCKED-branch state-file write extends to:
+
+```bash
+bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" update-issue \
+  "$session_id" <n> blocked \
+  blocked_question="<question>" \
+  body_snapshot="<issue body at park time>" \
+  labels_snapshot="<comma-joined label names at park time>"
+```
+
+`labels_snapshot` is stored as a single string (comma-joined sorted label names) rather than a JSON array to keep the allow-list value type uniform; the comparison splits and re-sorts before diffing. `body_snapshot` is the raw issue body at park time. Both are refreshed in the same `update-issue` call after each poll-tick comparison (regardless of whether a change was detected), so a quiescent issue keeps producing "no change" without re-firing on prior diffs and a noisy issue's snapshot stays current.
+
+What counts as "changed" (any one of the following, compared against the snapshot):
 
 - **Label removed** — the `blocked` label (or any label the user said they would flip to unblock) is no longer present. The user effectively answered the parked question by removing the gate.
-- **Body updated** — the issue body differs from the snapshot. The user or another tool answered the parked question by editing the body in place (the most common pattern when `/refine-issues` records a clarification).
+- **Body updated** — the issue body differs from `body_snapshot`. The user or another tool answered the parked question by editing the body in place (the most common pattern when `/refine-issues` records a clarification).
 - **State == CLOSED** — the issue was closed externally (e.g. as a duplicate or no-repro). The clarification will never come; the run should not sit parked forever.
 
 Action on change:
 
-- **Label removed or body updated** → re-enter Phase 5 with the affected issue: clear the `blocked` label if still present, flip per-issue state from `blocked` back to `scheduled`, and let the next tick pick it up via the normal Phase 5 dispatch path. Surface a chat line summarising what changed ("`#<N>: blocked label removed externally — resuming`" / "`#<N>: body edited externally — resuming`").
-- **State == CLOSED** → treat as MERGED-equivalent for state-machine purposes: flip per-issue state from `blocked` to a terminal "externally closed" outcome, drop it from the in-flight set, and surface to the user (`#<N>: closed externally — not re-dispatched`). Do **not** open a PR or re-dispatch — the issue is gone, and re-entering Phase 5 against a closed issue would either fail or produce orphan work.
+- **Label removed or body updated** → re-enter Phase 5 with the affected issue: clear the `blocked` label if still present, flip per-issue state from `blocked` back to `scheduled` (`update-issue <id> <n> scheduled` — the `blocked_question` / `body_snapshot` / `labels_snapshot` fields stay in the file but are ignored once `state != "blocked"`), and let the next tick pick it up via the normal Phase 5 dispatch path. Surface a chat line summarising what changed ("`#<N>: blocked label removed externally — resuming`" / "`#<N>: body edited externally — resuming`").
+- **State == CLOSED** → flip per-issue state from `blocked` to the terminal `externally_closed` outcome (`update-issue <id> <n> externally_closed`), drop it from the in-flight set, and surface to the user (`#<N>: closed externally — not re-dispatched`). Do **not** open a PR or re-dispatch — the issue is gone, and re-entering Phase 5 against a closed issue would either fail or produce orphan work. `externally_closed` qualifies for Phase 8 garbage collection alongside `merged`/`errored` (see § Garbage collection).
 
-Refresh the snapshot used for next-tick comparison after every poll so a quiescent issue keeps producing "no change" without re-firing on prior diffs.
+**Steady-state ticks are silent.** The digest-emission rule above (line 540) gates digests on `at least one issue is in-flight (in-progress or automerge_set)`, so the all-parked row by definition emits no digest on tick. Likewise the parked-issue poll only emits a chat line on a *change* (the three "Action on change" branches above) — a no-change tick is silent. This is intentional: an hourly heartbeat with nothing to report would be noise. Do not add a "no change" digest line to this branch; the next signal the user sees is either a real change event or the run completing.
 
-Cost note: one `gh issue view` per parked issue per hour is negligible — the all-parked branch is already low-frequency, and a typical run parks 1–3 issues at most. The poll is bounded above by the 3600s cadence and below by the size of the parked set.
+Cost note: one `gh issue view` per `blocked` issue per hour is negligible — the all-parked branch is already low-frequency, and a typical run parks 1–3 issues at most. The poll is bounded above by the 3600s cadence and below by the size of the `blocked` set.
 
 Opt-out: when the user says something like "stop polling, I'll re-invoke explicitly when ready," skip `ScheduleWakeup` for the all-parked row entirely (revert to the old `none` behaviour). The opt-out is per-run and is forgotten on `--resume`; the user can re-state it on resume if they still want it.
 
@@ -1384,7 +1402,7 @@ Final report to user:
 
 ### Phase 8.1 — Session-state garbage collection
 
-If every in-scope issue has reached a **fully-resolved** terminal state (`merged` or `errored`), delete the session state file:
+If every in-scope issue has reached a **fully-resolved** terminal state (`merged`, `errored`, or `externally_closed`), delete the session state file:
 
 ```bash
 bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" delete "$session_id"
@@ -1392,7 +1410,9 @@ bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" delete "$se
 
 `blocked` and `paused` do **not** qualify as fully-resolved — the user is expected to answer the parked question or wait out the cap and come back via `--resume <id>`. Keep the state file in those cases so the resume path has something to reattach to. Same logic for `scheduled` / `in-progress` / `automerge_set` issues: the run hasn't reached its end state, and a Claude Code crash or a deliberate `/clear` should leave a recoverable file behind.
 
-Concretely: delete only when every issue is `merged` or `errored`. Otherwise leave the file and let `--session list` surface it on the next invocation.
+`externally_closed` (the parked-issue poll observed `state == CLOSED` while `blocked` — see § Progress reporting § Parked-issue poll) **does** qualify: the issue is gone from GitHub's perspective, no further orchestrator action is possible, and re-dispatching against a closed issue would just produce orphan work. Treating it as fully-resolved (alongside `merged`/`errored`) prevents orphan state files in the all-parked-then-externally-closed-out-of-band scenario.
+
+Concretely: delete only when every issue is `merged`, `errored`, or `externally_closed`. Otherwise leave the file and let `--session list` surface it on the next invocation.
 
 A future `--session forget <id>` flag could expose the same `delete` subcommand for explicit cleanup of stuck-but-abandoned sessions; until then the user's manual escape hatch is `rm ~/.claude/state/workflow-implement/<id>.json` (or `bash session-state.sh delete <id>`).
 
