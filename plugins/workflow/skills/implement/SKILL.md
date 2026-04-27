@@ -20,8 +20,18 @@ The skill is self-contained: every dispatched agent receives the full work pipel
 | `/workflow:implement --milestone "<title>"` | Process all open issues in the milestone. |
 | `/workflow:implement --parent <n>` | Process all sub-issues of the parent issue. |
 | `/workflow:implement` | Default: equivalent to `--label scheduled`. |
+| `/workflow:implement --resume <id>` | Reattach to a prior session. Restores selector, resolved issue list, dep graph, and per-issue terminal state from `~/.claude/state/workflow-implement/<id>.json`, then re-enters Phase 5. |
+| `/workflow:implement --session list` | List resumable sessions in the per-user state directory: ID, repo, last-modified timestamp, selector summary, in-flight issue count. |
 
-Selectors compose: `/workflow:implement --milestone "MS-2 General" --label scheduled` intersects them.
+Selectors compose: `/workflow:implement --milestone "MS-2 General" --label scheduled` intersects them. **`--resume` does not compose with selectors** — the resumed state file already encodes the original selector, so passing both is a hard error. Pass `--resume <id>` alone.
+
+### Session lifecycle (orchestrator-level)
+
+Every `/workflow:implement` invocation owns a **session ID** of the form `wfi-YYYY-MM-DD-<4 hex chars>` (e.g. `wfi-2026-04-27-a1b2`). The orchestrator generates one at intake (Phase 1) for fresh runs, or reuses the supplied ID for `--resume`. Orchestrator-level state — selector, resolved issue list, dep graph, per-issue dispatch context, progress-digest tail — is persisted under that ID at `~/.claude/state/workflow-implement/<id>.json` so a conversation lost mid-run (Claude Code crash, host disconnect, deliberate `/clear`, context exhaustion, the user closing the laptop) can be resumed without re-typing the original selector.
+
+This is a different surface from **Phase 5 step 0 (per-issue resumption)**: that step recovers the *agent layer* (an in-flight branch / open PR) on a per-issue basis whenever it sees one. `--resume` rehydrates the *orchestrator layer* (selector, dep graph, task list, digest history) before Phase 5 runs at all. The two compose: `--resume` rehydrates orchestrator state, then Phase 5 step 0 still runs per-issue inside the rehydrated session and continues to discourage agent-level restart. See **§ Session state** below for the file shape and **§ Bail-outs** for the missing-state-file behaviour.
+
+> **Out of scope (future):** a concurrency guard that detects when two `/workflow:implement` invocations claim overlapping issues. With distinct session IDs it would be cheap to add — each session's state file lists its in-flight issue numbers — but it isn't implemented yet. A second invocation against an overlapping selector will silently race; the user is responsible for not starting one.
 
 ## Operating principles
 
@@ -87,7 +97,38 @@ If a label doesn't exist in the repo, create it once via `gh label create` (see 
 
 ## Phase 1 — Intake
 
-Resolve the issue list:
+### Phase 1.0 — Session ID
+
+Two paths, mutually exclusive:
+
+- **Fresh run (no `--resume`).** Generate a session ID and log it once, chat-visible, before resolving the issue list. The user uses this ID later if they need to `/workflow:implement --resume <id>` or `--session forget <id>` (see § Session state).
+
+  ```bash
+  session_id=$(printf 'wfi-%s-%s' \
+    "$(date -u +%Y-%m-%d)" \
+    "$(openssl rand -hex 2 2>/dev/null || head -c2 /dev/urandom | xxd -p)")
+  printf 'workflow:implement session: %s\n' "$session_id"
+  ```
+
+  Then proceed to issue-list resolution below.
+
+- **Resume (`--resume <id>`).** Load the persisted state file:
+
+  ```bash
+  bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" get <id>
+  ```
+
+  If the file is missing, **bail out hard** — see § Bail-outs. Do not auto-create. On success, the file contains everything Phase 1 / Phase 2 / Phase 3 would otherwise re-derive: selector args, resolved issue list, dep graph, per-issue terminal state, and the progress-digest tail. Skip the issue-list resolution, the Phase 2 clarification batch (already-confirmed clarifications were applied to issue bodies on the original run), and the Phase 3 dep-analysis pass (deps were declared and persisted). Re-enter the pipeline at Phase 4 — but **only to apply labels and create TaskList tasks for issues whose persisted state is `scheduled` or `in-progress`**; merged / blocked / paused / errored issues keep their existing state and are surfaced in the next progress digest. Phase 5 step 0 (per-issue resumption check) then runs as normal for every non-terminal issue.
+
+  Log the resumed session ID once, chat-visible, with a one-line summary so the user can confirm:
+
+  ```text
+  workflow:implement resumed: <id> — repo=<owner/repo> selector=<...> in-flight=<n>
+  ```
+
+### Phase 1.1 — Resolve the issue list
+
+Resolve the issue list (fresh runs only — `--resume` skips this):
 
 ```bash
 # Explicit numbers — fetch each.
@@ -144,6 +185,94 @@ The emitted block surfaces:
 
 If the helper script is unavailable for any reason (e.g. the plugin install is corrupted), the orchestrator can fall back to running the steps inline — but treat that as a degraded path and flag it. The script's output is the contract; the orchestrator's merge handoff depends on the `Merge mechanism:` trailer being present.
 
+## Session state
+
+The orchestrator persists per-run state under `~/.claude/state/workflow-implement/<id>.json` so a run can be resumed across conversations without re-deriving selector / issue list / dep graph / dispatch context. The file is created once at the end of Phase 3 (after dependency analysis is complete and the issue list is final), and updated at every Phase 5 state transition.
+
+### Path
+
+`$HOME/.claude/state/workflow-implement/<session-id>.json`
+
+Per-user (not per-project) so a user with multiple repo checkouts under `~/Projects` keeps a single state directory. The `repo` field inside the file scopes each session to a specific `<owner>/<repo>`, so cross-repo sessions don't collide. The `--session list` subcommand surfaces the `repo` field in its output for disambiguation.
+
+### Shape
+
+```json
+{
+  "session_id": "wfi-2026-04-27-a1b2",
+  "repo": "aidanns/claude-skills",
+  "created_at": "2026-04-27T11:42:00Z",
+  "updated_at": "2026-04-27T12:18:33Z",
+  "selector": {"label": "scheduled", "milestone": "MS-2 General"},
+  "deps": {"282": [281], "283": [281]},
+  "issues": {
+    "281": {
+      "number": 281,
+      "state": "merged",
+      "branch": "aidanns/foo",
+      "worktree": "/home/aidanns/Projects/claude-skills/.claude/worktrees/agent-xyz",
+      "pr_number": "91",
+      "pr_url": "https://github.com/aidanns/claude-skills/pull/91",
+      "blocked_question": null,
+      "paused_reason": null,
+      "errored_reason": null
+    },
+    "282": {"number": 282, "state": "in-progress", "branch": "aidanns/bar", "worktree": "...", "pr_number": null, "pr_url": null, "...": null},
+    "283": {"number": 283, "state": "scheduled", "...": null}
+  },
+  "digest_tail": [
+    {"ts": "2026-04-27T12:18:00Z", "line": "#282 https://… — review: pending — CI: pending (3/8) — merge: clean"}
+  ]
+}
+```
+
+Per-issue `state` field — terminal token from the orchestrator's perspective:
+
+- `scheduled` — Phase 4 applied the label, no agent dispatched yet.
+- `in-progress` — agent dispatched (Phase 5 step 4), PR may or may not be open yet.
+- `automerge_set` — orchestrator set automerge after review completed (Phase 5 step 5). Phase 5b's shell monitor is now driving the PR to merge.
+- `merged` — Phase 5b shell monitor emitted `MERGED`; Phase 6 housekeeping is done or in progress.
+- `blocked` — agent returned `BLOCKED <question>` (Phase 7). `blocked_question` carries the parked question.
+- `paused` — agent returned `PAUSED <reason>` (Phase 5 step 5 PAUSED branch). `paused_reason` carries the pause cause.
+- `errored` — agent returned `ERRORED <error>`. `errored_reason` carries the error string.
+
+The `digest_tail` keeps the last 50 progress-digest lines so a `--resume` reattachment can show the user where the run was last time without re-polling GitHub.
+
+### Helper script
+
+Read / write the state file via the colocated helper:
+
+```bash
+bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" <subcommand> ...
+```
+
+Subcommands:
+
+| Subcommand | Use |
+|---|---|
+| `init <id> <repo> <selector-json> <issues-json> [<deps-json>]` | Phase 3 → create the state file from the resolved issue list. Per-issue state defaults to `scheduled` and dispatch-context fields default to `null`. |
+| `get <id>` | Phase 1 (`--resume`) → print the state file, or exit 1 if missing. |
+| `path <id>` | Print the absolute path (whether or not the file exists). |
+| `update-issue <id> <issue#> <new-state> [<key=value> ...]` | Phase 5 / Phase 6 → flip per-issue state and patch dispatch-context fields. Allow-listed keys: `branch`, `worktree`, `pr_number`, `pr_url`, `blocked_question`, `paused_reason`, `errored_reason`. |
+| `append-digest <id> <line>` | Phase 5 progress reporting → append a digest line to `digest_tail` (capped at 50 entries). |
+| `list` | `--session list` → enumerate every state file with ID, repo, last-modified timestamp, selector summary, in-flight count. |
+| `delete <id>` | Phase 8 → remove the state file once every issue is terminal. |
+
+The script keeps all JSON manipulation inside `jq`; the orchestrator should not parse / format the JSON itself.
+
+### Garbage collection
+
+The state file is deleted in Phase 8 once every issue is **fully resolved** — `merged` or `errored`. `blocked` and `paused` do not count as fully resolved (the user is expected to come back via `--resume <id>`); see Phase 8.1 for the rule. A leftover file means a run aborted before reaching Phase 8 *or* parked on user input; `--session list` will surface it and the user can `--resume <id>` or manually clear it. A future `--session forget <id>` flag could expose the `delete` subcommand directly for explicit cleanup, but until then `rm ~/.claude/state/workflow-implement/<id>.json` is the manual escape hatch.
+
+### Layering with Phase 5 step 0
+
+`--resume` and Phase 5 step 0 cover different layers and compose cleanly:
+
+- **`--resume <id>`** rehydrates the **orchestrator layer**: selector, resolved issue list, dep graph, per-issue terminal state, progress-digest tail. It is invoked once at session start.
+- **Phase 5 step 0** rehydrates the **agent layer** per-issue: an existing branch / open PR / `in-progress` label. It runs once per issue inside the active session (whether fresh or resumed) and dispatches a *resumption prompt* instead of a *fresh prompt* when it detects partial work.
+
+A resumed session re-enters Phase 5 with rehydrated orchestrator state; Phase 5 step 0 then runs as normal per-issue. The two are not redundant — orchestrator state cannot be reconstructed from GitHub alone (selector args and dep graph aren't on the issues; the dispatch history isn't surfaced anywhere), and per-issue resumption can't be reconstructed from the state file alone (the dispatched agent's branch may have advanced past what the state file recorded). Treat them as a pair.
+
 ## Phase 2 — Pre-flight clarification
 
 Read each issue body in full. Identify *only* gaps that would cause a publicly-observable break if guessed wrong:
@@ -184,6 +313,21 @@ Build a directed acyclic graph; topologically order. Cycles are a hard error —
 
 When dependencies are declared (e.g. `Depends on #N`), encode them via `addBlockedBy` on the corresponding TaskCreate task (Phase 4) so the harness's native dep tracking surfaces blocked / unblocked transitions in the task list rather than relying on a manually-maintained graph.
 
+### Initialise session state
+
+At the end of Phase 3 (after the issue list is final and the dep graph is built), persist the orchestrator-level state file. **Fresh runs only — `--resume` reuses the existing file untouched.**
+
+```bash
+bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" init \
+  "$session_id" \
+  "<owner/repo>" \
+  '<selector-json — e.g. {"label":"scheduled","milestone":"MS-2 General"}>' \
+  '<issues-json — e.g. [281,282,283]>' \
+  '<deps-json — e.g. {"282":[281],"283":[281]}>'
+```
+
+Every issue is initialised with `state: "scheduled"` and empty dispatch-context fields. Subsequent state transitions (Phase 4 onwards) update the file via `update-issue` / `append-digest`.
+
 ## Phase 4 — Scheduling
 
 Apply `scheduled` to every in-scope issue and create one orchestrator task per issue via `TaskCreate` so progress is visible in the main session's task list:
@@ -194,9 +338,11 @@ gh issue edit <n> --add-label scheduled
 
 ```text
 TaskCreate(subject: "Process issue #<n> (<short title>)",
-           description: "<one-line scope>",
+           description: "[<session-id>] <one-line scope>",
            activeForm: "Processing #<n>")
 ```
+
+The `[<session-id>]` prefix on the `description` field surfaces the session ID alongside every TaskList row so the user can find it again without grepping the state directory — important because `--resume <id>` is the only way to reattach to a lost run, and the chat-visible intake log line scrolls off quickly. (The `subject` stays clean — adding the prefix there would clutter the TaskList and the same information is already in `description`.)
 
 Track task lifecycle in lockstep with the issue label lifecycle:
 
@@ -225,13 +371,16 @@ gh label create paused --color D4C5F9 \
 
 Loop until every issue is terminal (merged, parked, or excluded):
 
-0. **Resumption check** — before dispatching a fresh agent, look for state from a prior aborted attempt:
+0. **Resumption check (per-issue, agent layer)** — before dispatching a fresh agent, look for state from a prior aborted attempt:
 
    - Issue already labelled `in-progress` or `paused` (carried over from a halted run).
    - Open PR with `Closes #<N>` in its body.
    - Branch on origin matching the project's branch convention for this issue.
+   - **Session state file** for this run records `branch` / `pr_number` / `pr_url` for the issue (rehydrated on `--resume`, or written by the current run earlier in the session).
 
    If any exist, the prior agent partially completed work. Dispatch with a *resumption* prompt instead of the standard one: name the existing branch / PR explicitly and tell the agent "do NOT restart — check out the existing branch, fix what's incomplete, push, drive to merge." This avoids duplicate PRs and clobbered work.
+
+   **How this composes with `--resume <id>`.** `--resume` rehydrates the orchestrator layer — selector, dep graph, per-issue terminal state — *before* Phase 5 runs. This step then runs per-issue inside the rehydrated session and continues to discourage agent-level restart whenever it spots an existing branch / PR. The orchestrator-vs-agent layering is intentional: orchestrator state lives in the session state file (because it cannot be reconstructed from GitHub), agent state lives on GitHub (because it's the source of truth for branches / PRs / labels). Treat them as a pair — the state file's per-issue dispatch context (`branch`, `pr_number`) is *one* of the four signals this step considers, not the only one.
 
 1. **Pick next issue** — topologically eligible (all declared deps merged), not already in-progress / parked / merged. If nothing eligible but in-flight count < 3, the loop waits for a current agent to terminate.
 
@@ -302,6 +451,23 @@ Loop until every issue is terminal (merged, parked, or excluded):
    ```
 
    Each transition is an orchestrator action, parsed from a literal terminal token in the agent's `result` field. The implementing agent never sets automerge; the orchestrator does, after review (and address-review, if findings landed).
+
+   **State-file persistence on every transition.** Every state change below — `dispatch` (in-progress), `automerge_set`, `merged`, `blocked`, `paused`, `errored` — is mirrored into the session state file via the helper script *as part of the same orchestrator step that fires the transition*. This is what makes `--resume` viable: the file is the durable record of where the run is. Concretely:
+
+   ```bash
+   bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" update-issue \
+     "$session_id" <issue#> <new-state> [branch=... worktree=... pr_number=... pr_url=... blocked_question=... paused_reason=... errored_reason=...]
+   ```
+
+   - On dispatch (Phase 5 step 4): `update-issue <id> <n> in-progress branch=<b> worktree=<wt>`.
+   - On the implementing agent's `READY_FOR_REVIEW` return: `update-issue <id> <n> in-progress pr_number=<p> pr_url=<u>` (state stays `in-progress`; only the dispatch context advances).
+   - On automerge set (LGTM or `READY_TO_MERGE` branch): `update-issue <id> <n> automerge_set`.
+   - On the Phase 5b shell monitor's `MERGED` event: `update-issue <id> <n> merged` (Phase 6 housekeeping then runs).
+   - On `BLOCKED`: `update-issue <id> <n> blocked blocked_question="<question>"`.
+   - On `PAUSED`: `update-issue <id> <n> paused paused_reason="<reason>"`.
+   - On `ERRORED`: `update-issue <id> <n> errored errored_reason="<error>"`.
+
+   Treat the state-file write as part of the transition, not a follow-up: a Claude Code crash *between* the transition and the file write would leave the orchestrator and the file out of sync, which is the exact failure mode `--resume` is meant to prevent.
 
    **Automerge gate (invariant).** The orchestrator sets automerge ONLY after BOTH of these hold:
 
@@ -395,11 +561,16 @@ The 270s default is calibrated to the prompt-cache TTL (~5 min): it's the longes
 - Run drained (last PR merged) but two issues parked on user-input questions → **no wakeup**. The orchestrator awaits the user's reply; the next event is a user message, not a tick.
 - Mixed run: one implementing agent + one PR in `automerge_set` with CI in progress → **270s** (the in-progress-CI row matches before the agents-only row).
 
-**Per-issue probe** — for each in-flight issue `<N>`, invoke the digest-line script and emit its stdout verbatim:
+**Per-issue probe** — for each in-flight issue `<N>`, invoke the digest-line script and emit its stdout verbatim, then append it to the session state file's `digest_tail`:
 
 ```bash
-plugins/workflow/skills/implement/scripts/digest-line.sh <owner/repo> <N>
+line=$(plugins/workflow/skills/implement/scripts/digest-line.sh <owner/repo> <N>)
+printf '%s\n' "$line"
+bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" \
+  append-digest "$session_id" "$line"
 ```
+
+Capping `digest_tail` at 50 entries (handled by the helper) keeps the file bounded — the tail is for `--resume`-time context, not a full run log.
 
 The script encodes the full mapping (PR lookup, review-comment counts, CI rollup aggregation, merge-state derivation, edge cases) and emits exactly one line on stdout per the format below. The orchestrator does **not** run gh queries inline or format the line itself — that work moved into the script so each tick costs ~one bash invocation per in-flight issue instead of ~500-1K tokens of inline JSON inference.
 
@@ -484,7 +655,7 @@ When in doubt, suppress. The user can always `gh pr view <pr#>` if they want raw
 The orchestrator constructs the per-agent prompt by filling in the placeholders below. The full text — not a reference — goes into the Agent call so the dispatched agent has everything it needs without consulting this skill.
 
 ```
-You are implementing GitHub issue #<N> end-to-end. The issue body follows verbatim:
+You are implementing GitHub issue #<N> end-to-end. Session: <session-id>. The issue body follows verbatim:
 
 ---
 <full body refreshed via `gh issue view <N> --json body --jq .body`>
@@ -1142,7 +1313,7 @@ When `TaskUpdate(status: "completed")` is bundled into the same parallel tool-ca
 When an agent reports `BLOCKED`:
 
 - Verify the `blocked` label is set on the issue and the issue has a `Claude: Blocked` comment.
-- Record the question in a parked-questions list (in-memory; optionally write to `.claude/workflow-implement-state.json` for resumability).
+- Record the question in the session state file via `update-issue <id> <n> blocked blocked_question="<question>"` (Phase 5 step 5's `BLOCKED` branch already handles this; Phase 7 just confirms). The parked questions are now durable across conversations because the state file survives a `/clear`.
 - Continue with other ready issues.
 
 When the loop drains (no more eligible issues, in-flight count = 0):
@@ -1177,6 +1348,20 @@ Final report to user:
 - Reconciliation log (one line, only if Phase 8.0 flipped anything or detected an OPEN-but-completed inconsistency).
 - Suggested next step: `/workflow:implement --label blocked` to resume parked issues after answering.
 
+### Phase 8.1 — Session-state garbage collection
+
+If every in-scope issue has reached a **fully-resolved** terminal state (`merged` or `errored`), delete the session state file:
+
+```bash
+bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" delete "$session_id"
+```
+
+`blocked` and `paused` do **not** qualify as fully-resolved — the user is expected to answer the parked question or wait out the cap and come back via `--resume <id>`. Keep the state file in those cases so the resume path has something to reattach to. Same logic for `scheduled` / `in-progress` / `automerge_set` issues: the run hasn't reached its end state, and a Claude Code crash or a deliberate `/clear` should leave a recoverable file behind.
+
+Concretely: delete only when every issue is `merged` or `errored`. Otherwise leave the file and let `--session list` surface it on the next invocation.
+
+A future `--session forget <id>` flag could expose the same `delete` subcommand for explicit cleanup of stuck-but-abandoned sessions; until then the user's manual escape hatch is `rm ~/.claude/state/workflow-implement/<id>.json` (or `bash session-state.sh delete <id>`).
+
 After emitting the final-report message, fire one `PushNotification` summarising the run outcome — this is the bell for "the orchestration is done." Examples:
 
 - All clean: `PushNotification(message: "/implement: all <N> issues merged")`.
@@ -1192,6 +1377,8 @@ The skill stops the run rather than parking when:
 - The repo's default-branch ruleset rejects merges persistently across 3+ retries (likely environmental).
 - A dispatched agent reports a *non-recoverable* environmental error (cannot clone, cannot authenticate, missing required CLI tool).
 - The dependency graph contains a cycle.
+- **`--resume <id>` was passed but `~/.claude/state/workflow-implement/<id>.json` does not exist.** Do not auto-create — surface the error verbatim ("session state not found: <id>") and exit. The user typically wants to either (a) check for typos in the ID, (b) run `--session list` to see what is actually resumable, or (c) start a fresh run instead.
+- **`--resume <id>` was combined with a selector flag** (`--label`, `--milestone`, `--parent`, or explicit issue numbers). The resumed state file already encodes the original selector; combining the two is ambiguous. Surface "--resume cannot be combined with selector flags" and exit.
 
 In each case: leave labels as-is, surface immediately to user, do not proceed.
 
@@ -1199,28 +1386,6 @@ In each case: leave labels as-is, surface immediately to user, do not proceed.
 
 - **Usage-cap exhaustion**: agent returns `PAUSED`. Orchestrator records the reset time and re-dispatches a resumption agent (Phase 5 step 0 path) once the cap clears.
 - **Transient CI infra blips** (one-off rate limits, single workflow timeout): the orchestrator's CI-failure-fix path (Phase 5b — either in-place ≤50-line fix or the CI-failure-fix mini-agent) investigates and either pushes a fix or returns `ENVIRONMENTAL` for the orchestrator to surface; this is not a run-wide halt.
-
-## State persistence
-
-For runs that may span context windows, persist minimal state at `.claude/workflow-implement-state.json` in the project root:
-
-```json
-{
-  "in_scope": [280, 281, 282, 283, 284, 285, 286],
-  "merged": [280],
-  "automerge_set": {"281": "https://github.com/o/r/pull/91"},
-  "reviewing": {"285": "https://github.com/o/r/pull/95"},
-  "addressing": {"286": "https://github.com/o/r/pull/96"},
-  "in_progress": [282],
-  "blocked": {"283": "needs schema decision"},
-  "paused": {"284": "usage cap until 2026-04-25T10:10Z"},
-  "deps": {"281": [280], "282": [280]}
-}
-```
-
-The `reviewing` map tracks PRs in the orchestrator's review-subagent dispatch (after `READY_FOR_REVIEW`, before LGTM/FINDINGS lands). The `addressing` map tracks PRs in the address-review mini-agent dispatch (after `FINDINGS`, before `READY_TO_MERGE` lands). The `automerge_set` map tracks PRs handed off to Phase 5b's shell monitor; entries clear when the monitor emits `MERGED`.
-
-Read on start (if present, resume); write on every label change. Delete on Phase 8 completion.
 
 ## Tracker abstraction
 
