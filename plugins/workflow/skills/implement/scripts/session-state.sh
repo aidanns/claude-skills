@@ -187,11 +187,21 @@ cmd_update_issue() {
         exit 2
         ;;
     esac
-    patch_json=$(jq -n \
-      --argjson base "$patch_json" \
-      --arg k "$key" \
-      --arg v "$value" \
-      '$base + {($k): $v}')
+    # Empty value clears the field to JSON `null` (preserving the schema
+    # invariant established by `init` defaults: a "cleared" field is `null`,
+    # not the empty string). Non-empty values are written as JSON strings.
+    if [[ -z "$value" ]]; then
+      patch_json=$(jq -n \
+        --argjson base "$patch_json" \
+        --arg k "$key" \
+        '$base + {($k): null}')
+    else
+      patch_json=$(jq -n \
+        --argjson base "$patch_json" \
+        --arg k "$key" \
+        --arg v "$value" \
+        '$base + {($k): $v}')
+    fi
   done
 
   local tmp
