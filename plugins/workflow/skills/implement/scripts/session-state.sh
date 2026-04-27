@@ -24,9 +24,9 @@
 #
 #   update-issue <id> <issue#> <new-state> [<key=value> ...]
 #       Update the per-issue terminal state and any dispatch-context fields
-#       (branch, worktree, pr_number, pr_url, blocked_question, paused_reason,
-#       errored_reason, body_snapshot, labels_snapshot). Keys outside that
-#       allow-list are rejected so the schema stays disciplined.
+#       (branch, worktree, pr_number, pr_url, agent_id, blocked_question,
+#       paused_reason, errored_reason, body_snapshot, labels_snapshot). Keys
+#       outside that allow-list are rejected so the schema stays disciplined.
 #       <new-state> must be one of: scheduled, in-progress, automerge_set,
 #       merged, blocked, paused, errored, externally_closed. (externally_closed
 #       is the terminal outcome the parked-issue poll uses when an issue is
@@ -125,6 +125,7 @@ cmd_init() {
                     worktree: null,
                     pr_number: null,
                     pr_url: null,
+                    agent_id: null,
                     blocked_question: null,
                     paused_reason: null,
                     errored_reason: null,
@@ -180,17 +181,27 @@ cmd_update_issue() {
     key="${kv%%=*}"
     value="${kv#*=}"
     case "$key" in
-      branch|worktree|pr_number|pr_url|blocked_question|paused_reason|errored_reason|body_snapshot|labels_snapshot) ;;
+      branch|worktree|pr_number|pr_url|agent_id|blocked_question|paused_reason|errored_reason|body_snapshot|labels_snapshot) ;;
       *)
-        printf 'session-state: rejected key %q (allowed: branch worktree pr_number pr_url blocked_question paused_reason errored_reason body_snapshot labels_snapshot)\n' "$key" >&2
+        printf 'session-state: rejected key %q (allowed: branch worktree pr_number pr_url agent_id blocked_question paused_reason errored_reason body_snapshot labels_snapshot)\n' "$key" >&2
         exit 2
         ;;
     esac
-    patch_json=$(jq -n \
-      --argjson base "$patch_json" \
-      --arg k "$key" \
-      --arg v "$value" \
-      '$base + {($k): $v}')
+    # Empty value clears the field to JSON `null` (preserving the schema
+    # invariant established by `init` defaults: a "cleared" field is `null`,
+    # not the empty string). Non-empty values are written as JSON strings.
+    if [[ -z "$value" ]]; then
+      patch_json=$(jq -n \
+        --argjson base "$patch_json" \
+        --arg k "$key" \
+        '$base + {($k): null}')
+    else
+      patch_json=$(jq -n \
+        --argjson base "$patch_json" \
+        --arg k "$key" \
+        --arg v "$value" \
+        '$base + {($k): $v}')
+    fi
   done
 
   local tmp
