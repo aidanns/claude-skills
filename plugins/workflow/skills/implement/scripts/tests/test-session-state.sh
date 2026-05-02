@@ -252,6 +252,25 @@ got=$(bash "$script" find-overlap acme/repo '[458]' --except wfi-self \
 assert_eq "find-overlap --except skips the named session" \
   '["wfi-other"]' "$got"
 
+# --- Test 15b: find-overlap accepts repeated --except for stale-pruning.
+# AC #4 of #104 is explicit that stale sessions are NOT counted as
+# active overlap. The orchestrator runs `find-stale` first, then passes
+# every stale session ID alongside its own session ID via repeated
+# `--except` flags. Without this, a dead session whose state file still
+# carries `state ∈ scheduled|in-progress|automerge_set` would surface as
+# a concurrency conflict and trigger a false-positive bail prompt — the
+# precise false positive AC #4 was written to exclude.
+sandbox=$(with_sandbox); cleanup_dirs+=("$sandbox")
+export WORKFLOW_IMPLEMENT_STATE_DIR="$sandbox"
+run_init wfi-caller acme/repo '[458]'
+run_init wfi-stale-peer acme/repo '[458]'
+run_init wfi-live-peer acme/repo '[458]'
+got=$(bash "$script" find-overlap acme/repo '[458]' \
+        --except wfi-caller --except wfi-stale-peer \
+      | jq -c '[.[] | .session_id]')
+assert_eq "find-overlap --except is repeatable for stale-peer pruning" \
+  '["wfi-live-peer"]' "$got"
+
 # --- Test 16: find-overlap excludes terminal / parked states. ---------
 # Active set = scheduled | in-progress | automerge_set. The other
 # possibilities (merged | blocked | paused | errored | externally_closed)

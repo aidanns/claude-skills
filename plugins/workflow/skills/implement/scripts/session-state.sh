@@ -57,7 +57,7 @@
 #       user sees there is a problem and can follow the manual recovery
 #       sequence in SKILL.md.
 #
-#   find-overlap <repo> <issues-json> [--except <session-id>]
+#   find-overlap <repo> <issues-json> [--except <session-id>]...
 #       Scan every state file under the state directory, filter to sessions
 #       whose `repo` field matches <repo>, and intersect each session's
 #       active issue numbers (state ∈ scheduled | in-progress |
@@ -65,11 +65,13 @@
 #       array of overlapping tuples on stdout — one element per session
 #       with overlap, of shape `{session_id, repo, updated_at,
 #       overlapping_issues:[<n>...]}`. Sessions with no overlap are omitted.
-#       The optional `--except <session-id>` flag skips the named session
-#       (the caller's own state file, when the scan happens after `init`
-#       wrote it). Exits 0 with `[]` when no overlap is found — the orches-
-#       trator distinguishes "scan ran cleanly, no overlap" from "scan
-#       failed" by parsing the JSON, not by exit code.
+#       `--except <session-id>` (repeatable) skips named sessions; the
+#       orchestrator passes its own session ID and every session ID
+#       returned by `find-stale` so dead sessions don't surface as
+#       concurrency conflicts (AC #4 of #104). Exits 0 with `[]` when no
+#       overlap is found — the orchestrator distinguishes "scan ran
+#       cleanly, no overlap" from "scan failed" by parsing the JSON, not
+#       by exit code.
 #
 #       The active-state set deliberately excludes `merged`, `blocked`,
 #       `paused`, `errored`, and `externally_closed`: a session that is
@@ -124,7 +126,7 @@ Usage:
   session-state.sh add-worktree <id> <issue#> <path>
   session-state.sh append-digest <id> <digest-line>
   session-state.sh list
-  session-state.sh find-overlap <repo> <issues-json> [--except <session-id>]
+  session-state.sh find-overlap <repo> <issues-json> [--except <session-id>]...
   session-state.sh find-stale [<repo>] <gh-state-json-path-or-->
   session-state.sh delete <id>
 EOF
@@ -398,15 +400,28 @@ cmd_find_overlap() {
   local issues_json="${2:?issues-json required}"
   shift 2
 
-  # Optional `--except <session-id>` lets the caller skip its own state
-  # file. The most common case is the orchestrator scanning after Phase 3
-  # has written the new session's state — the new session would otherwise
-  # appear in its own overlap output.
-  local except=""
+  # Optional `--except <session-id>` (repeatable) lets the caller skip
+  # specific peer sessions from the overlap result. Two distinct callers:
+  #
+  #   1. The caller's own state file. The orchestrator scanning after
+  #      Phase 3 has written the new session's state would otherwise see
+  #      itself in the output.
+  #
+  #   2. Stale sessions identified by `find-stale`. AC #4 of #104 is
+  #      explicit that stale sessions are NOT counted as active overlap
+  #      — they are surfaced separately and offered for cleanup. The
+  #      orchestrator runs `find-stale` first, then passes each stale
+  #      session ID as `--except <id>` so a dead state file does not
+  #      generate a false-positive concurrency-conflict prompt.
+  local except_json='[]'
   while (( $# > 0 )); do
     case "$1" in
       --except)
-        except="${2:?--except requires a session-id}"
+        local v="${2:?--except requires a session-id}"
+        except_json=$(jq -nc \
+          --argjson acc "$except_json" \
+          --arg id "$v" \
+          '$acc + [$id]')
         shift 2
         ;;
       *)
@@ -427,9 +442,9 @@ cmd_find_overlap() {
   read_all_sessions | jq -c \
     --arg repo "$repo" \
     --argjson input "$issues_json" \
-    --arg except "$except" \
+    --argjson except "$except_json" \
     '
-    map(select(.repo == $repo and (.session_id != $except)))
+    map(select(.repo == $repo and (.session_id | IN($except[]) | not)))
     | map(
         . as $sess
         | ($input
