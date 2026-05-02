@@ -1,0 +1,31 @@
+# Regression fixture for issue #101.
+#
+# Captures the exact shapes that broke the original Phase 1.5 detector on
+# `aidanns/agent-auth/.github/workflows/merge-bot.yml`:
+#   1. `pull_request: types: [labeled]` written as an inline-flow YAML list
+#      (single line, square brackets) rather than a block list.
+#   2. The `automerge` label-name guard buried inside a multi-line `if:`
+#      block joined by `||` clauses, so it isn't on the same line as the
+#      `if:` keyword.
+# Both shapes must be detected for the merge-mechanism trailer to flip from
+# the default `gh pr merge --auto --squash` to the label-bot branch.
+
+name: Merge Bot
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_run:
+    workflows: [Test, Check]
+    types: [completed]
+  workflow_dispatch:
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'automerge')
+      || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+      || github.event_name == 'workflow_dispatch'
+    steps:
+      - run: echo "merge"

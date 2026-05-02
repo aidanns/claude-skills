@@ -1,0 +1,19 @@
+# Companion fixture: same merge-bot pattern but with the `types:` value
+# written as a YAML block list (one entry per line, leading `-`). Both list
+# styles are valid GitHub Actions syntax, so both must be detected.
+
+name: Merge Bot (block-list variant)
+
+on:
+  pull_request:
+    types:
+      - opened
+      - labeled
+      - synchronize
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'automerge')
+    steps:
+      - run: echo "merge"
