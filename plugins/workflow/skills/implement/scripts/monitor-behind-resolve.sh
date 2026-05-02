@@ -15,9 +15,30 @@
 #                                                     surfaces once per monitor session.
 #
 # Returns 0 in all cases; emits exactly one event per invocation (or zero, in
-# the case of a deduplicated MONITOR_DEGRADED that's already been surfaced, or
-# a `git merge` that conflicts and falls through to the outer loop's CONFLICT
-# detection on the next tick).
+# the case of a deduplicated MONITOR_DEGRADED that's already been surfaced, a
+# `git merge` that conflicts and falls through to the outer loop's CONFLICT
+# detection on the next tick, or a CI-not-fully-green precheck that defers the
+# resolve to a later tick — see the precheck block below).
+#
+# CI-green precheck: before doing any work, the helper queries
+# `statusCheckRollup` and requires that every check is fully resolved AND
+# fully green (`conclusion ∈ {SUCCESS, SKIPPED, NEUTRAL}`). If any check is
+# still pending (null / IN_PROGRESS conclusion) or has a non-green resolved
+# conclusion (FAILURE / CANCELLED / TIMED_OUT / etc.), the helper exits 0
+# silently — emit nothing, wait for the next tick. This mirrors a
+# project-side merge-bot's `recheck` gate: don't push a merge commit that
+# would restart the in-flight CI cycle, and don't try to catch up a branch
+# whose CI is already failing for non-BEHIND reasons.
+#
+# The precheck queries `gh pr view --json statusCheckRollup` itself rather
+# than accepting the rollup as a 5th positional argument. The duplicate
+# query (the outer monitor already fetches the rollup each tick) costs ~one
+# `gh` call per BEHIND tick — rare in practice, since BEHIND ticks only
+# happen when `main` has moved out from under the PR — and keeps the
+# helper's signature unchanged. Threading the rollup through as a JSON
+# blob argument would tangle the helper's contract with the outer
+# monitor's JSON shape and make standalone invocation harder to reason
+# about.
 #
 # Usage: monitor-behind-resolve.sh <pr#> <pr-branch> <base-branch> <dedupe-file>
 #
@@ -62,6 +83,50 @@ emit_degraded_once() {
   emit "MONITOR_DEGRADED $pr $step $(collapse "$reason")"
   printf '%s\n' "$marker" >>"$dedupe_file"
 }
+
+# CI-green precheck. Defer the local-merge catch-up until the most recent
+# fully-completed CI run is green; otherwise we'd push a merge commit that
+# restarts an in-flight CI cycle (slowing the merge instead of speeding it
+# up) or catch up a PR whose CI is already failing for non-BEHIND reasons
+# (the failure needs human attention, not a branch update).
+#
+# "Fully green" = every check in `statusCheckRollup` has
+# `conclusion ∈ {SUCCESS, SKIPPED, NEUTRAL}`. A null / empty conclusion is
+# treated as pending (still running), which fails the gate. Any other
+# resolved conclusion (FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED,
+# STALE) also fails the gate.
+#
+# The empty-rollup case (no CI configured on the PR) is treated as green
+# — there's no CI cycle to disrupt, and the BEHIND state still needs
+# resolving. This matches how the outer monitor's STALLED_GREEN detector
+# treats an empty rollup.
+#
+# Returns 0 (proceed) iff the rollup is empty or every entry is in the
+# accepted-conclusion set; returns 1 (defer) otherwise. The `gh pr view`
+# call is silenced on failure (network blip, transient API error) and the
+# precheck defers to be safe rather than racing in on stale data.
+ci_fully_green() {
+  local rollup
+  rollup=$(gh pr view "$pr" --json statusCheckRollup --jq '.statusCheckRollup' 2>/dev/null)
+  if [[ -z "$rollup" || "$rollup" == "null" ]]; then
+    # `gh` failed or returned no rollup -- defer to the next tick rather
+    # than acting on missing data.
+    return 1
+  fi
+  # Every entry must have an accepted conclusion. `(.conclusion // "")` so a
+  # null/missing conclusion becomes "" (pending), which is not in the
+  # accepted set and thus fails the gate.
+  jq -e 'all(.[]?; (.conclusion // "") as $c
+            | $c == "SUCCESS" or $c == "SKIPPED" or $c == "NEUTRAL")' \
+    <<<"$rollup" >/dev/null 2>&1
+}
+
+if ! ci_fully_green; then
+  # Silent no-op: wait for the next tick. The outer monitor will re-poll
+  # the rollup and re-invoke us; once CI lands fully-green, the resolve
+  # will proceed.
+  exit 0
+fi
 
 # Run the catch-up in a subshell so the `cd` into the tempdir doesn't leak
 # back to the caller. The dedupe file lives outside the subshell (passed by

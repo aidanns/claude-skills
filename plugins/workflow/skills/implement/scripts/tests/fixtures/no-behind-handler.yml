@@ -1,0 +1,21 @@
+# Negative fixture for issue #100.
+#
+# A standard CI workflow that does not handle BEHIND in any form. The
+# Phase 1.5 detector must emit `Project BEHIND handling: no` for repos
+# whose only workflows match this shape — otherwise the Phase 5b
+# monitor would (incorrectly) skip its in-shell auto-resolve and the PR
+# would silently park behind main.
+
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./run-tests.sh

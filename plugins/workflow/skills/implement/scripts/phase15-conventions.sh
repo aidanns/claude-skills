@@ -60,6 +60,38 @@ phase15_extract_label_guard() {
     <<<"$content" | grep -oE "'[^']+'" | head -1 | tr -d "'" || true
 }
 
+# Does this workflow contain a project-side BEHIND-handling step? Two
+# detection signals (either is sufficient):
+#
+#   1. A `PUT /pulls/{n}/update-branch` API call — the canonical way a
+#      merge-bot catches up a stale PR head before merging. Recognised by
+#      a literal `update-branch` substring; the path is consistent across
+#      `gh api`, `curl`, and Octokit invocations.
+#   2. A `mergeStateStatus`/`mergeable_state` reference where the workflow
+#      branches on the value being `BEHIND`/`behind`. Catches workflows
+#      that probe the state explicitly before invoking `update-branch` or
+#      that route to a different remediation. We require both halves
+#      (`mergeStateStatus`/`mergeable_state` *and* `BEHIND`/`behind`) on
+#      the same workflow so an unrelated `mergeable_state == 'clean'`
+#      check or a stray `behind` token elsewhere doesn't false-positive.
+#
+# Returns 0 iff the workflow handles BEHIND, 1 otherwise. Whitespace and
+# casing variants are tolerated where they appear in the wild; the
+# substring-anchored signals are deliberately broad because under-detection
+# (skipping a project-side handler and racing it from the monitor) is the
+# expensive failure mode this trailer is meant to prevent.
+phase15_workflow_handles_behind() {
+  local content="$1"
+  if grep -q 'update-branch' <<<"$content"; then
+    return 0
+  fi
+  if grep -qE 'mergeStateStatus|mergeable_state' <<<"$content" \
+     && grep -qE '\b(BEHIND|behind)\b' <<<"$content"; then
+    return 0
+  fi
+  return 1
+}
+
 # When sourced (e.g. by the regression test), expose only the helpers. Skip
 # argument parsing and all `gh api` calls so the test runs offline.
 if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]]; then
@@ -96,8 +128,28 @@ if (( sample_size == 0 )); then
   else
     default_merge='gh pr merge --squash'
   fi
+  # Probe BEHIND handling even on empty-sample repos so the trailer is
+  # always present in the emitted block (downstream consumers can rely on
+  # the trailer existing rather than having to handle two output shapes).
+  empty_sample_behind="no"
+  empty_sample_workflows=$(gh api "repos/${repo}/contents/.github/workflows" \
+    --jq '.[]?.name' 2>/dev/null || true)
+  if [[ -n "$empty_sample_workflows" ]]; then
+    while IFS= read -r wf; do
+      [[ -z "$wf" ]] && continue
+      [[ "$wf" =~ \.ya?ml$ ]] || continue
+      wf_content=$(gh api "repos/${repo}/contents/.github/workflows/${wf}" \
+        --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
+      [[ -z "$wf_content" ]] && continue
+      if phase15_workflow_handles_behind "$wf_content"; then
+        empty_sample_behind="yes"
+        break
+      fi
+    done <<<"$empty_sample_workflows"
+  fi
   cat <<EOF
 Current PR conventions (observed): no merged PRs in this repo yet — fall back to project docs (\`CLAUDE.md\`, \`CONTRIBUTING.md\`) for conventions.
+Project BEHIND handling: ${empty_sample_behind}
 Merge mechanism: ${default_merge}
 EOF
   exit 0
@@ -226,6 +278,7 @@ workflows=$(gh api "repos/${repo}/contents/.github/workflows" \
   --jq '.[]?.name' 2>/dev/null || true)
 
 candidate_label=""
+project_handles_behind="no"
 if [[ -n "$workflows" ]]; then
   while IFS= read -r wf; do
     [[ -z "$wf" ]] && continue
@@ -234,12 +287,24 @@ if [[ -n "$workflows" ]]; then
       --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
     [[ -z "$wf_content" ]] && continue
 
+    # Project BEHIND-handling probe: scans every workflow (independent of
+    # the label-bot probe below) so a project that uses immediate-squash
+    # merge but still has a separate update-branch workflow is detected.
+    # Once we've found one match, skip the further-grep cost on remaining
+    # workflows.
+    if [[ "$project_handles_behind" == "no" ]] \
+       && phase15_workflow_handles_behind "$wf_content"; then
+      project_handles_behind="yes"
+    fi
+
     phase15_workflow_listens_to_labeled "$wf_content" || continue
 
     label=$(phase15_extract_label_guard "$wf_content")
-    if [[ -n "$label" ]]; then
+    if [[ -n "$label" && -z "$candidate_label" ]]; then
       candidate_label="$label"
-      break
+      # Don't `break` — keep iterating so the BEHIND probe gets a chance
+      # to fire on workflows we'd otherwise have skipped. The early-out
+      # on `project_handles_behind` above bounds the extra cost.
     fi
   done <<<"$workflows"
 fi
@@ -279,5 +344,6 @@ cat <<EOF
 - Labels seen at merge time:
 ${label_hist}
 - ${changelog_line}
+Project BEHIND handling: ${project_handles_behind}
 Merge mechanism: ${merge_mechanism}
 EOF

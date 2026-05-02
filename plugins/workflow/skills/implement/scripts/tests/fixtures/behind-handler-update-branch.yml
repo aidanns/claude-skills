@@ -1,0 +1,27 @@
+# Regression fixture for issue #100.
+#
+# Captures a project-side merge-bot that handles BEHIND by calling
+# `PUT /pulls/{n}/update-branch` (the canonical pattern documented on
+# `aidanns/agent-auth/.github/workflows/merge-bot.yml`). The Phase 1.5
+# `Project BEHIND handling:` trailer must be `yes` for any workflow
+# matching this shape so the Phase 5b monitor knows to defer to the bot.
+
+name: Merge Bot
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_run:
+    workflows: [Test, Check]
+    types: [completed]
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'automerge')
+    steps:
+      - name: Catch up branch when behind
+        run: |
+          gh api --method PUT \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/update-branch" \
+            -f expected_head_sha="${HEAD_SHA}"

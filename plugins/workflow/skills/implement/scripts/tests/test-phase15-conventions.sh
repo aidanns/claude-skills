@@ -47,6 +47,17 @@ assert_guard() {
   assert_eq "$name" "$expected" "$actual"
 }
 
+assert_handles_behind() {
+  local name="$1" fixture="$2" expected="$3"
+  local content; content="$(cat "${fixtures}/${fixture}")"
+  if phase15_workflow_handles_behind "$content"; then
+    actual=true
+  else
+    actual=false
+  fi
+  assert_eq "$name" "$expected" "$actual"
+}
+
 # Issue #101: inline-flow `types: [labeled]` plus a multi-line `if:` block
 # whose label-name guard is buried inside an `||` clause. The pre-fix
 # detector missed both halves of this pattern and so emitted the wrong
@@ -73,6 +84,27 @@ assert_guard   "no label guard yields empty extraction" \
 # Negative: workflow does not subscribe to `pull_request: labeled` at all.
 assert_listens "non-pull_request workflow is rejected" \
   "no-pull-request-trigger.yml" false
+
+# Issue #100: project-side BEHIND handlers must be detected so the Phase 5b
+# monitor defers to the bot instead of racing it. Two recognised shapes:
+#   1. `update-branch` API call (canonical merge-bot pattern).
+#   2. Explicit `mergeStateStatus`/`mergeable_state` probe + `BEHIND`
+#      branching (workflows that detect the state but route elsewhere).
+assert_handles_behind "update-branch API call recognised as BEHIND handler" \
+  "behind-handler-update-branch.yml" true
+assert_handles_behind "mergeStateStatus + BEHIND probe recognised as BEHIND handler" \
+  "behind-handler-mergeable-state.yml" true
+
+# Negative: workflow does not handle BEHIND in any form. The detector
+# must NOT mark these as project-handles-BEHIND, otherwise the Phase 5b
+# monitor would silently skip its auto-resolve and the PR would park.
+assert_handles_behind "plain CI workflow is not a BEHIND handler" \
+  "no-behind-handler.yml" false
+# A merge-bot fixture whose label-bot pattern is detected but that has
+# no BEHIND-handling logic must still come back as a non-handler — the
+# two probes are independent.
+assert_handles_behind "label-bot fixture without BEHIND handling is not a BEHIND handler" \
+  "merge-bot-inline-flow.yml" false
 
 if (( failed != 0 )); then
   printf '\nFAIL: one or more assertions failed.\n' >&2
