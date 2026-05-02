@@ -21,7 +21,8 @@ The skill is self-contained: every dispatched agent receives the full work pipel
 | `/workflow:implement --parent <n>` | Process all sub-issues of the parent issue. |
 | `/workflow:implement` | Default: equivalent to `--label scheduled`. |
 | `/workflow:implement --resume <id>` | Reattach to a prior session. Restores selector, resolved issue list, dep graph, and per-issue terminal state from `~/.claude/state/workflow-implement/<id>.json`, then re-enters Phase 5. |
-| `/workflow:implement --session list` | List resumable sessions in the per-user state directory: ID, repo, last-modified timestamp, selector summary, in-flight issue count. |
+| `/workflow:implement --session list` | List resumable sessions in the per-user state directory: ID, repo, last-modified timestamp, selector summary, in-flight issue count. The orchestrator follows up with the `find-stale` probe so any session whose every active issue is CLOSED on GitHub is annotated `(stale — every active issue is CLOSED)` alongside a copy-pasteable `delete` invocation. |
+| `/workflow:implement <selector> --force` | Suppress the Phase 1.1 overlap-prompt — proceed even if another active session claims an overlapping issue. Equivalent to selecting `continue` at the interactive prompt. Use only after an eyes-on `--session list` review. **Carve-out (AC #3 of #104):** even with `--force`, the orchestrator still surfaces a one-line force-confirm prompt when an overlapping issue carries a Phase 2 clarification recorded by the peer session — the user is presumed to have forgotten the peer was running, and silently overriding a recorded clarification is the architecturally-divergent merge this guard exists to prevent. |
 
 Selectors compose: `/workflow:implement --milestone "MS-2 General" --label scheduled` intersects them. **`--resume` does not compose with selectors** — the resumed state file already encodes the original selector, so passing both is a hard error. Pass `--resume <id>` alone.
 
@@ -31,7 +32,7 @@ Every `/workflow:implement` invocation owns a **session ID** of the form `wfi-YY
 
 This is a different surface from **Phase 5 step 0 (per-issue resumption)**: that step recovers the *agent layer* (an in-flight branch / open PR) on a per-issue basis whenever it sees one. `--resume` rehydrates the *orchestrator layer* (selector, dep graph, task list, digest history) before Phase 5 runs at all. The two compose: `--resume` rehydrates orchestrator state, then Phase 5 step 0 still runs per-issue inside the rehydrated session and continues to discourage agent-level restart. See **§ Session state** below for the file shape and **§ Bail-outs** for the missing-state-file behaviour.
 
-> **Out of scope (future):** a concurrency guard that detects when two `/workflow:implement` invocations claim overlapping issues. With distinct session IDs it would be cheap to add — each session's state file lists its in-flight issue numbers — but it isn't implemented yet. A second invocation against an overlapping selector will silently race; the user is responsible for not starting one.
+**Concurrency guard at intake (#104).** When a fresh `/workflow:implement` invocation resolves its issue list at Phase 1.1, the orchestrator first runs a stale-session probe (every active issue CLOSED on GitHub → dead session left behind by a Claude Code crash / host disconnect, surfaced for cleanup but not counted as overlap), then scans every other state file in the same repo for sessions whose active issue numbers (state ∈ `scheduled` | `in-progress` | `automerge_set`) intersect the resolved list. Overlap is surfaced as a Phase-2-style batched message — the user picks `continue`, `skip <issue#>`, or bails to `--resume` the other session. Default behaviour on overlap is to bail; `--force` skips the interactive ask and proceeds — **except** that when an overlapping issue carries a Phase 2 clarification recorded by the peer session, even `--force` still surfaces a one-line force-confirm prompt (AC #3 — the architecturally-divergent merge described in the issue is exactly the failure mode that carve-out prevents). Stale sessions are offered up for `bash session-state.sh delete <id>` and never auto-deleted. See **§ Phase 1.0 — Session ID** and **§ Phase 1.1 — Resolve the issue list** for the exact wiring.
 
 ## Operating principles
 
@@ -191,6 +192,136 @@ gh api "repos/:owner/:repo/issues/<n>/sub_issues" --jq '.[].number'
 
 Exclude any issue that is closed, has the `released` label, or is currently labelled `in-progress` by a different active session (check the comment trail to disambiguate). Surface a one-line note for each excluded issue.
 
+#### Concurrency guard
+
+After resolving the issue list and applying the exclusion rules above, run the intake guard **before** the Phase 4 label / TaskList writes. Two `/workflow:implement` invocations running against the same repo can otherwise silently race the same issue — the architecturally-divergent merge described in #104 (one session merged a different design than the user clarified with the other) is the failure mode this guard prevents.
+
+The guard runs **the stale probe first, then the overlap probe**. The ordering is load-bearing: AC #4 of #104 is explicit that stale sessions are NOT counted as active overlap, and a state file whose every active issue is now CLOSED on GitHub would otherwise surface as a concurrency conflict — a false positive (the session is dead, not racing). Run `find-stale` first, collect the stale session IDs, then pass each one to `find-overlap --except <id>` so the overlap surface excludes them up front.
+
+Both probes need a `gh_state` mapping `{"<n>": "OPEN"|"CLOSED"}` covering every active issue across every peer state file in this repo — `find-stale` is offline-by-default and the orchestrator owns the network calls. Build it once:
+
+```bash
+sshelp="$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh"
+
+# Collect the active issue numbers across every state file scoped to
+# this repo. `list` is offline-by-default, so re-read each state file
+# with `get` and pull the active-state issue keys via jq.
+active_issues=$(bash "$sshelp" list \
+                | awk -F'\t' -v r="$repo" '$2 == r {print $1}' \
+                | while read -r id; do
+                    bash "$sshelp" get "$id" \
+                    | jq -r '.issues
+                             | with_entries(select(.value.state
+                                                   | IN("scheduled",
+                                                        "in-progress",
+                                                        "automerge_set")))
+                             | keys[]'
+                  done \
+                | sort -u)
+
+# Ask GitHub for the OPEN/CLOSED state of each one.
+gh_state=$(printf '%s\n' "$active_issues" \
+           | while read -r n; do
+               [[ -z "$n" ]] && continue
+               s=$(gh issue view "$n" --repo "$repo" --json state --jq .state)
+               printf '%s %s\n' "$n" "$s"
+             done \
+           | jq -nR '[inputs | split(" ") | {(.[0]): .[1]}] | add // {}')
+```
+
+Then run the two probes:
+
+```bash
+# Resolved in-scope issues from the steps above, as a JSON array.
+issues_json='[456,457,458]'   # example
+repo='aidanns/agent-auth'
+
+# 1. Stale probe — collects every dead session in this repo. Use the
+#    result both to suppress false positives in (2) and to surface a
+#    cleanup prompt later (§ Stale-session probe).
+stale=$(bash "$sshelp" find-stale "$repo" - <<<"$gh_state")
+mapfile -t stale_except_args < <(jq -r '.[] | "--except\n" + .session_id' <<<"$stale")
+
+# 2. Overlap probe — peers with active claims on the resolved list,
+#    minus any stale peers from step 1 plus the orchestrator's own
+#    session ID.
+overlap=$(bash "$sshelp" find-overlap "$repo" "$issues_json" \
+                --except "$session_id" \
+                "${stale_except_args[@]}")
+```
+
+`find-overlap` emits a JSON array of `{session_id, repo, updated_at, overlapping_issues:[<n>...]}` tuples — one per active peer session that intersects the input. Empty array → proceed silently. Non-empty → at least one peer session has an active claim. "Active" means `state ∈ {scheduled, in-progress, automerge_set}`: a peer that is `blocked` / `paused` does not hold an active dispatch (the issue can be picked up safely; the resumed session would notice on its next loop tick), and `merged` / `errored` / `externally_closed` are terminal. `--except` is repeatable; pass every stale session ID alongside the orchestrator's own session ID to keep dead state files out of the overlap surface.
+
+##### Surface overlap to the user (Phase-2-style batched message)
+
+When the array is non-empty, surface it to the user with the same single-batched-message UX Phase 2 uses for clarifications. The default action is **bail** unless the user explicitly confirms or `--force` was passed on the invocation:
+
+```text
+Concurrency conflict — another /workflow:implement session is already claiming an
+issue this run is about to take. The 2026-05-01 reproduction (cc40 vs the unnamed
+sibling on aidanns/agent-auth #458) is exactly the failure mode this guard prevents:
+two sessions racing the same issue, the second one merging an architecturally-
+divergent design while the first is still working.
+
+Overlap detected:
+  1. wfi-2026-05-01-cc40 — repo=aidanns/agent-auth — updated 2026-05-01T12:05Z
+       overlapping issues: #458
+  2. wfi-2026-05-01-aaaa — repo=aidanns/agent-auth — updated 2026-05-02T09:11Z
+       overlapping issues: #458
+
+Pick one:
+  • continue                        — proceed anyway (race the other session — only
+                                      do this if you are sure the other session has
+                                      ended and the state file just hasn't been
+                                      cleaned up). Equivalent to passing --force.
+  • hand off                        — bail this run; resume the other session
+                                      instead via /workflow:implement --resume <id>.
+  • skip <issue#> [<issue#> …]      — drop the named issues from this run's scope
+                                      and continue with the rest. The peer session
+                                      keeps them.
+```
+
+Wait for the user's answer. The orchestrator routes the answer:
+
+- **`continue`** — log the override, append a digest line via `append-digest` recording the overridden session IDs, and proceed to Phase 1.5. The peer session(s) will notice the contention on their next loop tick if the issue's labels diverge.
+- **`hand off`** — abort this run with a Bail-out (see § Bail-outs). Surface the resume command for each peer session.
+- **`skip <issue#>`** — drop the named issues from the resolved list and re-run the overlap scan. Continue if the new list is empty of overlap; re-prompt if the user picked the same answer that left overlap.
+
+If the invocation carried `--force`, skip the full bail prompt — but **still surface a one-line force-confirm** when an overlapping issue carries a Phase 2 clarification recorded by the peer session. AC #3 of #104 is explicit that the orchestrator should not silently proceed when the peer has clarifications baked into an overlapping issue body, *even if the user passed `--force`* — the user is presumed to have forgotten the peer session was running, and the architecturally-divergent merge described in the issue is precisely the failure mode this case prevents.
+
+Detection. For each peer session in the `overlap` array, read its `body_snapshot` field (per-issue, populated at the BLOCKED transition — see § Session state § Per-issue dispatch-context fields) for each overlapping issue. If the field is non-null on any overlapping issue, that peer has a Phase 2 clarification recorded for the issue. (`body_snapshot` is the orchestrator's most reliable signal that "this issue's body was changed by Phase 2 / a `Claude: Blocked — <q>` answer cycle"; it's the same field the parked-issue poll uses to detect out-of-band edits.) For peer sessions without a populated `body_snapshot`, the implementing agent is mid-flight and the user clarified at intake — the issue body was edited then, and the peer's `created_at` is the lower bound; cross-check `gh issue view <n> --json body,updatedAt` against that timestamp as a fallback.
+
+Force-confirm prompt:
+
+```text
+Concurrency override — --force was passed, but the peer session(s) recorded Phase 2
+clarifications on overlapping issue bodies. Per #104 AC #3 the orchestrator does
+not silently proceed in this case even with --force — the architecturally-divergent
+merge described in the issue is exactly the failure mode this prompt prevents.
+
+Overlapping issues with peer-recorded Phase 2 clarifications:
+  • #458 — peer wfi-2026-05-01-cc40 — Strategy A vs Strategy C clarification on body
+
+Continue? (yes / no — default no)
+```
+
+`yes` → log the override, append a digest line, proceed. `no` → bail (same as `hand off` in the un-forced bail prompt). When `--force` is set AND no overlapping issue carries a peer-recorded Phase 2 clarification, skip the force-confirm prompt entirely — log a one-line audit notice (`overlap detected, --force → proceeding (peer sessions: <ids>)`) and proceed. `--force` is the explicit "I have already checked `--session list` and know what I'm doing" escape hatch — typically used when a prior session crashed without cleanup and the user is resuming the same logical work.
+
+##### Stale-session probe (offered for cleanup, not auto-deleted)
+
+`find-stale` emits the same `{session_id, repo, updated_at, active_issues:[<n>...]}` shape as `find-overlap`, restricted to sessions where every active issue is CLOSED on GitHub — a session that nominally still has dispatches in flight, but every dispatched issue has been closed (merged elsewhere, deleted as duplicate, hand-merged by the user) without the orchestrator updating the state file. That is a dead session.
+
+The `stale` variable from step 1 of the worked example carries the result. After the overlap prompt resolves (or when there was no overlap), surface stale sessions to the user — but do **not** auto-delete (a state file deletion is irrecoverable, and a user who saw an issue close out-of-band may still want the digest history):
+
+```text
+Stale sessions detected (every active issue is CLOSED on GitHub):
+  • wfi-2026-04-30-deef — repo=aidanns/agent-auth — last update 2026-04-30T18:42Z
+      active issues: #401 #402 #403 — all CLOSED on GitHub
+      Delete? bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" delete wfi-2026-04-30-deef
+```
+
+Continue with the run regardless of the user's response — stale-session cleanup is an out-of-band housekeeping prompt, not a gate on the new run. The user can copy-paste the suggested `delete` invocation now, later, or never.
+
 ### Auto-memory sweep for known-broken CI / manual workarounds
 
 Sweep `~/.claude/projects/<project-slug>/memory/` for entries matching `*_bot_secrets*`, `*_broken*`, `*_pending*`, or whose body contains `manual workaround` / `skip silently` / `secrets not configured`. Inject any matches into every dispatch prompt under a "Known-broken CI / manual workarounds in this project" section.
@@ -314,7 +445,9 @@ Subcommands:
 | `add-worktree <id> <issue#> <path>` | Phase 5 / Phase 5b → append `<path>` to `issues[<issue#>].worktrees`. Idempotent — re-adding a path the array already contains is a no-op. The orchestrator calls this immediately after parsing each `isolation: worktree`-dispatched agent's terminal notification, so Phase 6 housekeeping can iterate every worktree spawned during the PR's lifecycle. |
 | `append-digest <id> <line>` | Phase 5 progress reporting → append a digest line to `digest_tail` (capped at 50 entries). |
 | `list` | `--session list` → enumerate every state file with ID, repo, last-modified timestamp, selector summary, in-flight count. |
-| `delete <id>` | Phase 8 → remove the state file once every issue is terminal. |
+| `find-overlap <repo> <issues-json> [--except <id>]` | Phase 1.1 → emit a JSON array of peer sessions whose active issues (state ∈ `scheduled`/`in-progress`/`automerge_set`) intersect the input issue list, scoped to `<repo>`. `--except <id>` skips the named session (the caller's own state file when the scan runs after `init`). Returns `[]` when no overlap is found. |
+| `find-stale [<repo>] <gh-state-json>` | Phase 1.1 → emit a JSON array of sessions whose every active issue is CLOSED on GitHub per the supplied mapping (`{"<n>": "OPEN"|"CLOSED"}`). Mapping is read from a file path or `-` for stdin so the script stays offline-by-default; the orchestrator owns the `gh issue view` calls. |
+| `delete <id>` | Phase 8 → remove the state file once every issue is terminal. Also offered to the user by the Phase 1.1 stale-session probe. |
 
 The script keeps all JSON manipulation inside `jq`; the orchestrator should not parse / format the JSON itself.
 
@@ -1620,6 +1753,7 @@ The skill stops the run rather than parking when:
 - **`--resume <id>` was passed but `~/.claude/state/workflow-implement/<id>.json` does not exist.** Do not auto-create — surface the error verbatim ("session state not found: <id>") and exit. The user typically wants to either (a) check for typos in the ID, (b) run `--session list` to see what is actually resumable, or (c) start a fresh run instead.
 - **`--resume <id>` was passed and the state file exists but is unparseable JSON** (truncated mid-write after a crash / disk-full / SIGKILL, partial schema, corrupted UTF-8). Surface the error verbatim ("session state corrupted: <path>") and point the user at **§ Session state § Recovering a corrupted state file** for the manual recovery sequence. Do not attempt to repair in-place — re-deriving from a half-written file is how silent state-divergence happens. The user explicitly chooses between "fix the JSON by hand" and "delete the file and lose dep graph / digest history."
 - **`--resume <id>` was combined with a selector flag** (`--label`, `--milestone`, `--parent`, or explicit issue numbers). The resumed state file already encodes the original selector; combining the two is ambiguous. Surface "--resume cannot be combined with selector flags" and exit.
+- **The Phase 1.1 overlap scan found a peer session and the user picked `hand off`** (or `--force` was *not* set and the user declined to confirm `continue`). Surface the peer session ID(s) plus the `/workflow:implement --resume <id>` invocation the user can run to continue the existing work, and exit. This is the default outcome when overlap is detected — the failure mode (#104) it prevents is two sessions silently racing the same issue and merging architecturally-divergent designs.
 
 In each case: leave labels as-is, surface immediately to user, do not proceed.
 
