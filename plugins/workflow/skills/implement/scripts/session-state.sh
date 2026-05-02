@@ -241,7 +241,7 @@ cmd_add_worktree() {
   # contract violation worth its own exit-2 ("you passed something
   # nonsensical, here's why") so the caller can distinguish.
   if (( $# < 3 )); then
-    printf 'session-state: 3: path required\n' >&2
+    printf 'session-state: add-worktree path required\n' >&2
     exit 1
   fi
   local path="$3"
