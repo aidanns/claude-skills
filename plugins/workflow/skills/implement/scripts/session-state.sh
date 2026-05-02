@@ -57,6 +57,45 @@
 #       user sees there is a problem and can follow the manual recovery
 #       sequence in SKILL.md.
 #
+#   find-overlap <repo> <issues-json> [--except <session-id>]
+#       Scan every state file under the state directory, filter to sessions
+#       whose `repo` field matches <repo>, and intersect each session's
+#       active issue numbers (state ∈ scheduled | in-progress |
+#       automerge_set) against the input <issues-json> array. Emit a JSON
+#       array of overlapping tuples on stdout — one element per session
+#       with overlap, of shape `{session_id, repo, updated_at,
+#       overlapping_issues:[<n>...]}`. Sessions with no overlap are omitted.
+#       The optional `--except <session-id>` flag skips the named session
+#       (the caller's own state file, when the scan happens after `init`
+#       wrote it). Exits 0 with `[]` when no overlap is found — the orches-
+#       trator distinguishes "scan ran cleanly, no overlap" from "scan
+#       failed" by parsing the JSON, not by exit code.
+#
+#       The active-state set deliberately excludes `merged`, `blocked`,
+#       `paused`, `errored`, and `externally_closed`: a session that is
+#       parked on a clarification (`blocked`) or paused on a usage cap
+#       (`paused`) is still alive in the user's mental model, but neither
+#       holds an *active dispatch* on the issue — a fresh run claiming the
+#       same issue can pick it up safely (the resumed session would notice
+#       on its next loop tick that the label changed). Concretely: the
+#       overlap that matters is "two implementing agents racing the same
+#       PR", not "the same issue lives in two state files."
+#
+#   find-stale [<repo>] <gh-state-json>
+#       Determine which sessions are stale — every active issue (state ∈
+#       scheduled | in-progress | automerge_set) has GitHub-state CLOSED
+#       per the supplied <gh-state-json> mapping (`{"<issue#>": "OPEN" |
+#       "CLOSED"}`). The mapping is read from a path argument or `-` for
+#       stdin; the orchestrator owns the `gh issue view` calls that
+#       populate it (this script stays offline-by-default — no network).
+#       Optional <repo> filters the scan to that `<owner>/<repo>` only.
+#       Emits a JSON array of `{session_id, repo, updated_at,
+#       active_issues:[<n>...]}` tuples on stdout — one element per stale
+#       session. Sessions with at least one OPEN active issue, or with no
+#       active issues at all (every issue terminal — Phase 8 GC will
+#       handle them), are omitted. Exits 0 with `[]` when no stale
+#       sessions are found.
+#
 #   delete <id>
 #       Remove the state file. No-op if it doesn't exist (the all-terminal
 #       garbage-collection path in Phase 8 calls this; idempotency keeps
@@ -85,6 +124,8 @@ Usage:
   session-state.sh add-worktree <id> <issue#> <path>
   session-state.sh append-digest <id> <digest-line>
   session-state.sh list
+  session-state.sh find-overlap <repo> <issues-json> [--except <session-id>]
+  session-state.sh find-stale [<repo>] <gh-state-json-path-or-->
   session-state.sh delete <id>
 EOF
   exit 2
@@ -328,6 +369,147 @@ cmd_list() {
   done
 }
 
+# Read every parseable state file into a single JSON array on stdout.
+# Unparseable files are silently skipped: `cmd_list` is the surface that
+# flags corruption to the user, and we do not want a corrupted neighbour
+# session to block a fresh intake's overlap or stale scan. Returns `[]`
+# when the state directory does not exist.
+read_all_sessions() {
+  if [[ ! -d "$state_dir" ]]; then
+    printf '[]\n'
+    return 0
+  fi
+  local f parseable=()
+  for f in "$state_dir"/*.json; do
+    [[ -f "$f" ]] || continue
+    if jq -e . "$f" >/dev/null 2>&1; then
+      parseable+=("$f")
+    fi
+  done
+  if (( ${#parseable[@]} == 0 )); then
+    printf '[]\n'
+    return 0
+  fi
+  jq -s -c . "${parseable[@]}"
+}
+
+cmd_find_overlap() {
+  local repo="${1:?repo required}"
+  local issues_json="${2:?issues-json required}"
+  shift 2
+
+  # Optional `--except <session-id>` lets the caller skip its own state
+  # file. The most common case is the orchestrator scanning after Phase 3
+  # has written the new session's state — the new session would otherwise
+  # appear in its own overlap output.
+  local except=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --except)
+        except="${2:?--except requires a session-id}"
+        shift 2
+        ;;
+      *)
+        printf 'session-state: find-overlap: unexpected argument %q\n' "$1" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  # Validate the issues-json input — bail with exit 2 on malformed input
+  # rather than silently treating bad input as "no overlap" (which would
+  # bypass the guard at intake exactly when it matters most).
+  if ! jq -e 'type == "array" and all(.[]; type == "number")' >/dev/null 2>&1 <<<"$issues_json"; then
+    printf 'session-state: find-overlap: <issues-json> must be a JSON array of numbers\n' >&2
+    exit 2
+  fi
+
+  read_all_sessions | jq -c \
+    --arg repo "$repo" \
+    --argjson input "$issues_json" \
+    --arg except "$except" \
+    '
+    map(select(.repo == $repo and (.session_id != $except)))
+    | map(
+        . as $sess
+        | ($input
+           | map(tostring)
+           | map(select(
+               ($sess.issues[.] // {}) as $rec
+               | ($rec.state // "") | IN("scheduled", "in-progress", "automerge_set")
+             ))
+           | map(tonumber)
+          ) as $overlap
+        | select($overlap | length > 0)
+        | {
+            session_id: $sess.session_id,
+            repo: $sess.repo,
+            updated_at: $sess.updated_at,
+            overlapping_issues: $overlap
+          }
+      )
+    '
+}
+
+cmd_find_stale() {
+  # Either `find-stale <repo> <gh-state-json>` or `find-stale <gh-state-json>`.
+  # The repo argument is optional and acts as a filter; absent, every
+  # session is considered. The gh-state-json argument is required — pass
+  # `-` to read from stdin or a path to read from disk.
+  if (( $# < 1 )); then
+    printf 'session-state: find-stale: <gh-state-json> required\n' >&2
+    exit 2
+  fi
+
+  local repo="" gh_state_src
+  if (( $# == 1 )); then
+    gh_state_src="$1"
+  else
+    repo="$1"
+    gh_state_src="$2"
+  fi
+
+  local gh_state_json
+  if [[ "$gh_state_src" == "-" ]]; then
+    gh_state_json=$(cat)
+  else
+    if [[ ! -f "$gh_state_src" ]]; then
+      printf 'session-state: find-stale: gh-state file not found: %s\n' "$gh_state_src" >&2
+      exit 2
+    fi
+    gh_state_json=$(cat "$gh_state_src")
+  fi
+
+  if ! jq -e 'type == "object" and all(.[]; type == "string")' >/dev/null 2>&1 <<<"$gh_state_json"; then
+    printf 'session-state: find-stale: <gh-state-json> must be a JSON object {"<n>": "OPEN"|"CLOSED"}\n' >&2
+    exit 2
+  fi
+
+  read_all_sessions | jq -c \
+    --arg repo "$repo" \
+    --argjson gh "$gh_state_json" \
+    '
+    map(select($repo == "" or .repo == $repo))
+    | map(
+        . as $sess
+        | ([$sess.issues[]
+            | select(.state | IN("scheduled", "in-progress", "automerge_set"))
+            | .number]
+          ) as $active
+        | select(($active | length) > 0)
+        | select($active
+                 | all(. as $n
+                       | ($gh[$n | tostring] // "OPEN") == "CLOSED"))
+        | {
+            session_id: $sess.session_id,
+            repo: $sess.repo,
+            updated_at: $sess.updated_at,
+            active_issues: $active
+          }
+      )
+    '
+}
+
 cmd_delete() {
   local id="${1:?id required}"
   local path
@@ -347,6 +529,8 @@ main() {
     add-worktree)   cmd_add_worktree "$@" ;;
     append-digest)  cmd_append_digest "$@" ;;
     list)           cmd_list "$@" ;;
+    find-overlap)   cmd_find_overlap "$@" ;;
+    find-stale)     cmd_find_stale "$@" ;;
     delete)         cmd_delete "$@" ;;
     -h|--help|help) usage ;;
     *)              usage ;;
