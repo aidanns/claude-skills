@@ -226,6 +226,7 @@ The emitted block surfaces:
 - **Labels at merge time** — a histogram of every label seen across the sample (label → `<n>/<sample-size>`), so the dispatched agent can spot consistently-applied ones (`automerge`, `no changelog`, etc.).
 - **Manual changelog entries** — required / occasional / not observed, computed from how many recent PRs touched a `changelog/@unreleased/pr-<N>-<slug>.yml` file.
 - **Merge mechanism** — emitted as the `Merge mechanism:` trailer. The orchestrator's Phase 5 step 5 LGTM / `READY_TO_MERGE` branches parse this line to decide which merge-handoff command to run. Three possible values, picked in this order: (1) `apply <label> label (merge-bot picks it up)` — emitted when the two-signal label-triggered merge-bot heuristic fires (a workflow listens to `pull_request: types: [labeled]` with a label-name guard, **and** that label appears on at least half of the recent merged PRs); (2) `gh pr merge --auto --squash` — emitted when the merge-bot heuristic doesn't fire and the script's `allow_auto_merge` probe (`gh api repos/<owner>/<repo> --jq '.allow_auto_merge'`) returns `true`; (3) `gh pr merge --squash` — emitted when the merge-bot heuristic doesn't fire **and** the probe returns `false` (or fails). The third branch exists because GitHub auto-merge is a per-repository setting: when it's disabled, `gh pr merge --auto --squash` fails with the GraphQL error `Auto merge is not allowed for this repository (enablePullRequestAutoMerge)` — `allow_auto_merge: false` is the cause, that error is the symptom. Emitting `gh pr merge --squash` (immediate squash-merge, no `--auto` flag) up-front avoids the round-trip and the per-PR hand-edit fallback. **The trailer is consumed at the post-review automerge gate (Phase 5 step 5), not earlier in the pipeline** — the implementing agent does not parse it, and Phase 1.5 itself never triggers a merge. Snapshotting the value at intake time keeps a single deterministic answer for the whole run; the orchestrator only acts on it once review (and address-review, if needed) has completed.
+- **Project BEHIND handling** — emitted as the `Project BEHIND handling: yes|no` trailer (above the `Merge mechanism:` line). `yes` when any workflow file in `.github/workflows/` calls `PUT /pulls/{n}/update-branch` (recognised by the literal `update-branch` substring) or branches on `mergeStateStatus`/`mergeable_state` against `BEHIND`/`behind`; `no` otherwise. Consumed by Phase 5b: when `yes`, the orchestrator launches the shell monitor with `MONITOR_PROJECT_HANDLES_BEHIND=yes` and the monitor skips its own BEHIND auto-resolve, deferring catch-up to the project-side merge-bot. Without this trailer the monitor and the project's bot would both run local-merge / `update-branch` in parallel — racing each other to update the PR head and (because the monitor doesn't gate on CI-green) restarting in-flight CI cycles.
 
 If the helper script is unavailable for any reason (e.g. the plugin install is corrupted), the orchestrator can fall back to running the steps inline — but treat that as a degraded path and flag it. The script's output is the contract; the orchestrator's merge handoff depends on the `Merge mechanism:` trailer being present.
 
@@ -992,7 +993,9 @@ When step 5 of the Phase 5 execution loop sets automerge (after the warm impleme
    - `gh pr merge <pr#> --auto --squash` when the repo has GitHub auto-merge enabled (`allow_auto_merge: true`). The Phase 5b monitor observes `MERGED` once the merge lands. **Note:** in a no-CI repo, this command resolves synchronously — the merge lands the moment automerge is enabled. That's why the gate above must hold *before* this command runs; once it runs, there is no further opportunity for review to intervene.
    - `gh pr merge <pr#> --squash` (immediate squash-merge, no `--auto` flag) when the repo has GitHub auto-merge disabled (`allow_auto_merge: false`). This is the primary command for that branch — not a fallback — because `gh pr merge --auto --squash` on such a repo fails with the GraphQL error `Auto merge is not allowed for this repository (enablePullRequestAutoMerge)`. The Phase 5b monitor observes `MERGED` on the next poll. The gate-before-command rule applies the same way: this command also resolves synchronously.
 2. Mark the issue as `automerge_set` in internal state. The implementing-agent slot frees here — the warm agent terminated with `READY_TO_MERGE`, the orchestrator just ran the merge handoff, and the next eligible issue can be picked up. (Cap=3 binds through merge handoff per Operating principles § "Concurrency cap: 3"; this is the moment that binding releases.)
-3. Launch the **shell monitor** (below) for that PR via the `Monitor` tool. The monitor's stdout is an event stream the orchestrator consumes.
+3. Launch the **shell monitor** (below) for that PR via the `Monitor` tool. The monitor's stdout is an event stream the orchestrator consumes. Pass the session's identity and the project's BEHIND-handling capability through env vars:
+   - `MONITOR_SESSION_ID=<session-id>` — the orchestrator's `wfi-...` session ID. The monitor uses this to scope the cross-PR `flock`-based BEHIND auto-resolve concurrency cap to a single workflow run (lockfile path: `$HOME/.claude/state/workflow-implement/<session-id>.behind-resolve.lock`). If unset, the lock falls back to `default`, which still bounds a single-PR run but lets parallel sessions step on each other — populate it from the orchestrator's session state when launching.
+   - `MONITOR_PROJECT_HANDLES_BEHIND=yes|no` — read directly from Phase 1.5's `Project BEHIND handling:` trailer (snapshotted in dispatch context, same place the `Merge mechanism:` line is read). When `yes`, the monitor skips its own BEHIND auto-resolve block entirely and lets the project-side merge-bot catch up the branch (the bot's design — wait for CI green, then update if BEHIND, then re-trigger CI on the merge commit — already handles this; running the monitor's auto-resolve in parallel races the bot and restarts in-flight CI cycles). The monitor still polls and emits all other events (`MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `STALLED_GREEN`); only the BEHIND branch is suppressed.
 4. Continue the Phase 5 execution loop — the slot is already free; pick up the next eligible issue if there is one.
 
 ### Shell monitor recipe
@@ -1021,6 +1024,26 @@ branch="${2:?pr branch required}"
 base="${3:-main}"
 poll="${POLL_INTERVAL:-45}"  # seconds between polls.
 stall_threshold="${STALL_THRESHOLD_SECONDS:-180}"  # first STALLED_GREEN emit.
+
+# Defer the BEHIND auto-resolve to the project's merge-bot when Phase 1.5
+# detected one (a workflow that calls `PUT /pulls/{n}/update-branch` or
+# branches on `mergeStateStatus == 'BEHIND'`). The bot's design — wait for
+# CI green, then update if BEHIND, then re-trigger CI on the merge commit
+# — handles this layer; the monitor running its own auto-resolve in
+# parallel races the bot and restarts in-flight CI cycles.
+project_handles_behind="${MONITOR_PROJECT_HANDLES_BEHIND:-no}"
+
+# Session-wide lockfile for the BEHIND auto-resolve. Bounds parallelism
+# across the orchestrator's monitored set so N simultaneously-BEHIND PRs
+# don't trigger N parallel update-branch+CI cycles when the project does
+# NOT have its own BEHIND-handling. `MONITOR_SESSION_ID` is the
+# orchestrator's `wfi-...` session ID; if unset, fall back to `default` so
+# a standalone monitor invocation still runs but parallel sessions can
+# step on each other (the orchestrator should always populate this).
+session_id="${MONITOR_SESSION_ID:-default}"
+behind_lockdir="$HOME/.claude/state/workflow-implement"
+mkdir -p "$behind_lockdir" 2>/dev/null || true
+behind_lockfile="${behind_lockdir}/${session_id}.behind-resolve.lock"
 
 emit() { printf '%s\n' "$*"; }  # one event per line, line-buffered by default.
 
@@ -1088,9 +1111,31 @@ while :; do
   # via the helper, which also surfaces upstream-step failures (clone /
   # fetch / merge) as MONITOR_DEGRADED so a broken auto-resolve doesn't
   # silently loop the BEHIND state forever.
-  if [[ "$msstatus" == "BEHIND" && "$mergeable" != "CONFLICTING" ]]; then
-    bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/monitor-behind-resolve.sh" \
-      "$pr" "$branch" "$base" "$degraded_dedupe"
+  #
+  # Three gates apply before we invoke the helper:
+  #   1. `project_handles_behind == "yes"`: the project has its own
+  #      merge-bot that handles BEHIND (Phase 1.5 detected an
+  #      `update-branch` API call or `mergeStateStatus == 'BEHIND'`
+  #      handler in a workflow). Defer entirely — the bot's CI-green
+  #      gating is the canonical implementation, and racing it from
+  #      here just restarts in-flight CI cycles.
+  #   2. CI-green precheck (inside the helper): the helper queries
+  #      statusCheckRollup itself and exits 0 silently if any check is
+  #      pending or non-green. Restarting CI by pushing a merge commit
+  #      while the previous run is still in flight slows the merge.
+  #   3. Session-wide flock: only one monitor across the whole
+  #      `/workflow:implement` session can be inside the auto-resolve
+  #      block at a time. Other monitors observing BEHIND simultaneously
+  #      back off silently to the next tick. `flock -n` is non-blocking;
+  #      the lock auto-releases when the subshell exits (helper returns
+  #      or is killed).
+  if [[ "$msstatus" == "BEHIND" && "$mergeable" != "CONFLICTING" \
+        && "$project_handles_behind" != "yes" ]]; then
+    (
+      flock -n 9 || exit 0
+      bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/monitor-behind-resolve.sh" \
+        "$pr" "$branch" "$base" "$degraded_dedupe"
+    ) 9>"$behind_lockfile"
   fi
 
   # ---- DIRTY / CONFLICTING: escalate to conflict-resolution mini-agent. ----
@@ -1174,6 +1219,9 @@ done
 Key behaviours:
 
 - **`BEHIND` auto-resolution stays in-shell.** Uses the same local-merge approach the implementing agent uses (`git fetch origin main && git merge --no-edit origin/main && git push`) — no `update-branch` API call, consistent with the rest of this skill.
+- **BEHIND auto-resolve gates on CI being fully green.** Before invoking the helper, the helper itself queries `statusCheckRollup` and verifies every check has `conclusion ∈ {SUCCESS, SKIPPED, NEUTRAL}`; a pending check (null/empty conclusion) or a non-green resolved conclusion (FAILURE / CANCELLED / TIMED_OUT / etc.) defers the resolve to the next tick (silent no-op — emit nothing). Mirrors the merge-bot.yml `recheck` pattern: don't push a merge commit that restarts the in-flight CI cycle, and don't try to catch up a PR whose CI is failing for non-BEHIND reasons. The empty-rollup case (no CI configured on the PR) is treated as green — there's no cycle to disrupt.
+- **BEHIND auto-resolve defers to project-side merge-bots.** When Phase 1.5's `Project BEHIND handling:` trailer is `yes` (a workflow calls `PUT /pulls/{n}/update-branch` or branches on `mergeStateStatus == 'BEHIND'`), the orchestrator launches the monitor with `MONITOR_PROJECT_HANDLES_BEHIND=yes` and the BEHIND branch is skipped entirely. The bot's design — wait for CI green, then update if BEHIND, then re-trigger CI on the merge commit — already handles this layer; running the monitor's auto-resolve in parallel races the bot and restarts in-flight CI cycles. The monitor still polls and emits all other events (`MERGED`, `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `STALLED_GREEN`).
+- **BEHIND auto-resolve is capped at one in-flight resolve per session.** Across the orchestrator's monitored set, only one Phase 5b monitor can be inside the BEHIND auto-resolve block at a time. Implemented via `flock -n` on `$HOME/.claude/state/workflow-implement/<session-id>.behind-resolve.lock` (lockfile path uses the `MONITOR_SESSION_ID` env var the orchestrator passes at launch — the same `wfi-...` session ID the state file uses). Other monitors observing BEHIND simultaneously back off silently to the next tick rather than emitting a digest line — the orchestrator's regular progress digest already surfaces BEHIND. Lockfile lifetime: one monitor's auto-resolve attempt; the lock auto-releases when the subshell carrying `flock` exits (helper returns or is killed). The lockfile itself persists across runs (no cleanup needed; `flock` only cares about open file descriptors, not file presence). Pairs with cross-PR caps that may exist on the project's merge-bot side — same shape, different layer.
 - **Push failures are surfaced, not swallowed.** `git push` stderr is captured and the exit code is checked. On failure, the monitor emits `BEHIND_RESOLVE_FAILED <pr#> <reason>` instead of `BEHIND_RESOLVED`, so a silently-rejected push (e.g. PAT missing `workflow` scope on `.github/workflows/*` changes) escalates to the user instead of the next tick re-observing BEHIND and looping. `BEHIND_RESOLVED` is only emitted when the push actually landed.
 - **Upstream-step failures are surfaced, not swallowed.** The `gh repo clone` / `git fetch` / `git merge` steps that precede the push each capture their stderr and emit `MONITOR_DEGRADED <pr#> <step> <reason>` on failure (where `<step>` is `clone` / `fetch` / `merge`). Without this surfacing, a broken auto-resolve (e.g. `gh repo view` failing in the monitor's tmpdir, a stale clone token, an unrelated-histories merge error) was invisible to the orchestrator: BEHIND would persist for poll after poll with no event, no `BEHIND_RESOLVED`, no `BEHIND_RESOLVE_FAILED`, and the user had to diagnose by hand. Each `<step>:<pr>` combination emits at most once per monitor session (dedupe lives in the `degraded_dedupe` tempfile) so a persistent failure surfaces exactly once. `gh repo view` is folded into the `clone` step because the view call is a substitution argument to the clone — if view fails the clone fails, and capturing the clone stderr captures both. A `git merge` that produces conflicts (rather than a hard merge error) is *not* surfaced as `MONITOR_DEGRADED merge` — it falls through to the next tick's CONFLICT path so the conflict-resolution mini-agent gets dispatched, same as before.
 - **Transient `gh` failures** (network blips, rate-limit retries) don't crash the loop — `|| true` and an empty-result check keep polling.

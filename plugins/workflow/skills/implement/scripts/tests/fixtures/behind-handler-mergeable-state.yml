@@ -1,0 +1,29 @@
+# Companion fixture for issue #100.
+#
+# Captures a workflow that probes BEHIND state explicitly via
+# `mergeStateStatus` / `mergeable_state` rather than calling
+# `update-branch` directly. Some merge-bots branch on the value before
+# routing to a different remediation (e.g. comment + manual escalation
+# rather than auto-update). The Phase 1.5 detector must still emit
+# `Project BEHIND handling: yes` for these so the Phase 5b monitor
+# defers and doesn't race the project's logic.
+
+name: Merge State Audit
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect merge state
+        run: |
+          state="$(gh pr view "${PR_NUMBER}" --json mergeStateStatus \
+            --jq '.mergeStateStatus')"
+          if [[ "${state}" == "BEHIND" ]]; then
+            echo "PR is behind base; remediation pending."
+          fi

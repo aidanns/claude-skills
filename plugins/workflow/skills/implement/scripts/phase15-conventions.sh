@@ -60,11 +60,80 @@ phase15_extract_label_guard() {
     <<<"$content" | grep -oE "'[^']+'" | head -1 | tr -d "'" || true
 }
 
+# Does this workflow contain a project-side BEHIND-handling step? Two
+# detection signals (either is sufficient):
+#
+#   1. A `PUT /pulls/{n}/update-branch` API call — the canonical way a
+#      merge-bot catches up a stale PR head before merging. Recognised by
+#      a literal `update-branch` substring; the path is consistent across
+#      `gh api`, `curl`, and Octokit invocations.
+#   2. A `mergeStateStatus`/`mergeable_state` reference where the workflow
+#      branches on the value being `BEHIND`/`behind`. Catches workflows
+#      that probe the state explicitly before invoking `update-branch` or
+#      that route to a different remediation. We require both halves
+#      (`mergeStateStatus`/`mergeable_state` *and* `BEHIND`/`behind`) on
+#      the same workflow so an unrelated `mergeable_state == 'clean'`
+#      check or a stray `behind` token elsewhere doesn't false-positive.
+#
+# Returns 0 iff the workflow handles BEHIND, 1 otherwise. Whitespace and
+# casing variants are tolerated where they appear in the wild; the
+# substring-anchored signals are deliberately broad because under-detection
+# (skipping a project-side handler and racing it from the monitor) is the
+# expensive failure mode this trailer is meant to prevent.
+phase15_workflow_handles_behind() {
+  local content="$1"
+  if grep -q 'update-branch' <<<"$content"; then
+    return 0
+  fi
+  if grep -qE 'mergeStateStatus|mergeable_state' <<<"$content" \
+     && grep -qE '\b(BEHIND|behind)\b' <<<"$content"; then
+    return 0
+  fi
+  return 1
+}
+
 # When sourced (e.g. by the regression test), expose only the helpers. Skip
 # argument parsing and all `gh api` calls so the test runs offline.
 if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]]; then
   return 0
 fi
+
+# Probe whether the project's `.github/workflows/` contains a workflow that
+# handles BEHIND. Returns `yes`/`no` on stdout; never exits non-zero (a
+# missing or empty workflow directory is treated as `no`). Wraps the
+# iterate-and-fetch pattern that would otherwise be duplicated between
+# the empty-sample short-circuit and the main-flow loop -- keeping a
+# single network-touching implementation prevents the two paths from
+# silently diverging if the detection signals are extended later (e.g. a
+# third probe added to `phase15_workflow_handles_behind`, or a workflow
+# filename filter added here).
+#
+# Lives below the source-guard so it isn't exposed to the offline tests
+# (the pure-text predicate `phase15_workflow_handles_behind` is the
+# unit-tested layer; this wrapper just sequences the network calls).
+phase15_probe_project_handles_behind() {
+  local probe_repo="$1"
+  local workflows
+  workflows=$(gh api "repos/${probe_repo}/contents/.github/workflows" \
+    --jq '.[]?.name' 2>/dev/null || true)
+  if [[ -z "$workflows" ]]; then
+    printf 'no\n'
+    return 0
+  fi
+  local wf wf_content
+  while IFS= read -r wf; do
+    [[ -z "$wf" ]] && continue
+    [[ "$wf" =~ \.ya?ml$ ]] || continue
+    wf_content=$(gh api "repos/${probe_repo}/contents/.github/workflows/${wf}" \
+      --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
+    [[ -z "$wf_content" ]] && continue
+    if phase15_workflow_handles_behind "$wf_content"; then
+      printf 'yes\n'
+      return 0
+    fi
+  done <<<"$workflows"
+  printf 'no\n'
+}
 
 repo="${1:?repo required, e.g. aidanns/claude-skills}"
 
@@ -96,8 +165,12 @@ if (( sample_size == 0 )); then
   else
     default_merge='gh pr merge --squash'
   fi
+  # Probe BEHIND handling even on empty-sample repos so the trailer is
+  # always present in the emitted block (downstream consumers can rely on
+  # the trailer existing rather than having to handle two output shapes).
   cat <<EOF
 Current PR conventions (observed): no merged PRs in this repo yet — fall back to project docs (\`CLAUDE.md\`, \`CONTRIBUTING.md\`) for conventions.
+Project BEHIND handling: $(phase15_probe_project_handles_behind "$repo")
 Merge mechanism: ${default_merge}
 EOF
   exit 0
@@ -244,6 +317,13 @@ if [[ -n "$workflows" ]]; then
   done <<<"$workflows"
 fi
 
+# Project BEHIND-handling probe. Routed through the shared helper rather
+# than folded into the label-bot loop above so both this branch and the
+# empty-sample short-circuit (above) call exactly one implementation --
+# preventing the two paths from silently diverging if the detection
+# signals are extended later.
+project_handles_behind=$(phase15_probe_project_handles_behind "$repo")
+
 if [[ -n "$candidate_label" ]]; then
   # Cross-check: does the label appear on most recent merged PRs?
   label_pr_count=$(jq --arg L "$candidate_label" \
@@ -279,5 +359,6 @@ cat <<EOF
 - Labels seen at merge time:
 ${label_hist}
 - ${changelog_line}
+Project BEHIND handling: ${project_handles_behind}
 Merge mechanism: ${merge_mechanism}
 EOF

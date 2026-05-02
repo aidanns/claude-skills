@@ -70,6 +70,42 @@ make_sandbox() {
 set -uo pipefail
 state_dir="${STATE_DIR}"
 case "$1 $2" in
+  "pr view")
+    # Used by the helper's CI-green precheck:
+    #   gh pr view <pr> --json statusCheckRollup --jq '.statusCheckRollup'
+    # The stub reads `state/checks_rollup` to decide what JSON to emit.
+    # File contents map to canned rollups:
+    #   `green`   -> all SUCCESS (proceed).
+    #   `pending` -> one IN_PROGRESS entry (defer).
+    #   `failure` -> one FAILURE entry (defer).
+    #   `mixed`   -> mixed SUCCESS+SKIPPED+NEUTRAL (proceed).
+    #   `empty`   -> empty array (proceed; no CI configured).
+    #   missing/anything else -> default to `green` so existing tests
+    #     that don't set this file see the helper's behaviour unchanged.
+    mode="$(cat "${state_dir}/checks_rollup" 2>/dev/null || echo green)"
+    case "$mode" in
+      pending)
+        printf '[{"name":"build","conclusion":null,"status":"IN_PROGRESS"}]\n'
+        ;;
+      failure)
+        printf '[{"name":"build","conclusion":"FAILURE","status":"COMPLETED"}]\n'
+        ;;
+      mixed)
+        printf '[{"name":"build","conclusion":"SUCCESS","status":"COMPLETED"},{"name":"lint","conclusion":"SKIPPED","status":"COMPLETED"},{"name":"sec","conclusion":"NEUTRAL","status":"COMPLETED"}]\n'
+        ;;
+      empty)
+        printf '[]\n'
+        ;;
+      gh_fail)
+        # Simulate a transient `gh` failure on the precheck path.
+        printf 'gh pr view: api error\n' >&2
+        exit 1
+        ;;
+      *)
+        printf '[{"name":"build","conclusion":"SUCCESS","status":"COMPLETED"}]\n'
+        ;;
+    esac
+    ;;
   "repo view")
     if [[ "$(cat "${state_dir}/view_mode" 2>/dev/null || echo ok)" == "fail" ]]; then
       printf 'gh repo view: rate-limited\n' >&2
@@ -311,6 +347,75 @@ assert_contains "gh repo view failure surfaces as MONITOR_DEGRADED clone" \
   "MONITOR_DEGRADED 951 clone" "$out"
 assert_contains "view-via-clone failure reason carries the clone-side stderr" \
   "invalid repository" "$out"
+rm -rf "$sandbox"
+
+# --- Test 9 (issue #100): CI-pending precheck defers the resolve.
+# When `statusCheckRollup` shows any check still running (null/missing
+# conclusion), the helper must exit silently — no MONITOR_DEGRADED, no
+# BEHIND_RESOLVED, no BEHIND_RESOLVE_FAILED. This guards the merge-bot
+# `recheck` ordering: don't push a merge commit that restarts an
+# in-flight CI cycle.
+sandbox=$(make_sandbox)
+dedupe="$sandbox/dedupe"; : >"$dedupe"
+printf 'pending\n' >"$sandbox/state/checks_rollup"
+out=$(run_helper "$sandbox" 1001 feature/p main "$dedupe" 2>&1)
+
+assert_eq "CI-pending precheck emits no event (silent next-tick deferral)" \
+  "" "$out"
+assert_eq "CI-pending precheck leaves dedupe file untouched" \
+  "" "$(cat "$dedupe")"
+rm -rf "$sandbox"
+
+# --- Test 10 (issue #100): CI-failed precheck also defers the resolve.
+# A non-green resolved conclusion (FAILURE / CANCELLED / TIMED_OUT) means
+# the PR has problems unrelated to BEHIND that need human attention; do
+# not push a merge commit on top of failing CI.
+sandbox=$(make_sandbox)
+dedupe="$sandbox/dedupe"; : >"$dedupe"
+printf 'failure\n' >"$sandbox/state/checks_rollup"
+out=$(run_helper "$sandbox" 1002 feature/f main "$dedupe" 2>&1)
+
+assert_eq "CI-failed precheck emits no event (silent next-tick deferral)" \
+  "" "$out"
+rm -rf "$sandbox"
+
+# --- Test 11 (issue #100): SUCCESS+SKIPPED+NEUTRAL is treated as fully
+# green — the precheck must not be a strict-SUCCESS-only check, since
+# real CI rollups commonly include skipped/neutral entries (e.g. a
+# matrix job that only runs on certain paths).
+sandbox=$(make_sandbox)
+dedupe="$sandbox/dedupe"; : >"$dedupe"
+printf 'mixed\n' >"$sandbox/state/checks_rollup"
+out=$(run_helper "$sandbox" 1003 feature/m main "$dedupe" 2>&1)
+
+assert_contains "SUCCESS+SKIPPED+NEUTRAL rollup proceeds to BEHIND_RESOLVED" \
+  "BEHIND_RESOLVED 1003" "$out"
+rm -rf "$sandbox"
+
+# --- Test 12 (issue #100): empty rollup (no CI configured on the PR)
+# proceeds — there's no in-flight cycle to disrupt and BEHIND still
+# needs resolving. Matches how the outer monitor's STALLED_GREEN
+# detector treats an empty rollup.
+sandbox=$(make_sandbox)
+dedupe="$sandbox/dedupe"; : >"$dedupe"
+printf 'empty\n' >"$sandbox/state/checks_rollup"
+out=$(run_helper "$sandbox" 1004 feature/e main "$dedupe" 2>&1)
+
+assert_contains "empty rollup proceeds to BEHIND_RESOLVED" \
+  "BEHIND_RESOLVED 1004" "$out"
+rm -rf "$sandbox"
+
+# --- Test 13 (issue #100): a transient `gh pr view` failure on the
+# precheck path defers rather than racing in on missing data. The
+# helper must treat gh-failure-during-precheck the same as
+# CI-not-fully-green and exit silently.
+sandbox=$(make_sandbox)
+dedupe="$sandbox/dedupe"; : >"$dedupe"
+printf 'gh_fail\n' >"$sandbox/state/checks_rollup"
+out=$(run_helper "$sandbox" 1005 feature/g main "$dedupe" 2>&1)
+
+assert_eq "transient gh failure on precheck defers silently" \
+  "" "$out"
 rm -rf "$sandbox"
 
 if (( failed != 0 )); then
