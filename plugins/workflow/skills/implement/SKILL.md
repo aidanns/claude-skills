@@ -256,6 +256,10 @@ Per-user (not per-project) so a user with multiple repo checkouts under `~/Proje
       "state": "merged",
       "branch": "aidanns/foo",
       "worktree": "/home/aidanns/Projects/claude-skills/.claude/worktrees/agent-xyz",
+      "worktrees": [
+        "/home/aidanns/Projects/claude-skills/.claude/worktrees/agent-xyz",
+        "/home/aidanns/Projects/claude-skills/.claude/worktrees/agent-aa13d13d7137911da"
+      ],
       "pr_number": "91",
       "pr_url": "https://github.com/aidanns/claude-skills/pull/91",
       "agent_id": null,
@@ -265,8 +269,8 @@ Per-user (not per-project) so a user with multiple repo checkouts under `~/Proje
       "body_snapshot": null,
       "labels_snapshot": null
     },
-    "282": {"number": 282, "state": "in-progress", "branch": "aidanns/bar", "worktree": "...", "pr_number": null, "pr_url": null, "agent_id": "agent-a98681219485b754d", "...": null},
-    "283": {"number": 283, "state": "scheduled", "...": null}
+    "282": {"number": 282, "state": "in-progress", "branch": "aidanns/bar", "worktree": "...", "worktrees": ["..."], "pr_number": null, "pr_url": null, "agent_id": "agent-a98681219485b754d", "...": null},
+    "283": {"number": 283, "state": "scheduled", "worktrees": [], "...": null}
   },
   "digest_tail": [
     {"ts": "2026-04-27T12:18:00Z", "line": "#282 https://… — review: pending — CI: pending (3/8) — merge: clean"}
@@ -287,6 +291,8 @@ Per-issue `state` field — terminal token from the orchestrator's perspective:
 
 Per-issue dispatch-context fields (`branch`, `worktree`, `pr_number`, `pr_url`, `agent_id`, `blocked_question`, `paused_reason`, `errored_reason`, `body_snapshot`, `labels_snapshot`) are written by `update-issue` as state advances. `agent_id` is the harness-assigned ID of the warm implementing agent — populated when the agent is dispatched (Phase 5 step 4) and cleared when the agent terminates (`READY_TO_MERGE`, `BLOCKED`, `PAUSED`, `ERRORED`). The malformed-terminal recovery probe (Phase 5 step 5) uses this field to decide whether to `SendMessage` the warm agent or fall back to dispatching the address-review mini-agent fresh.
 
+The `worktrees` array is the lifecycle-spanning record of every worktree the orchestrator spawned for the PR — implementing agent (Phase 5 step 4) plus any conflict-resolution / CI-failure-fix / review-comment / address-review fallback mini-agents dispatched later (Phase 5b). It is appended-to via the dedicated `add-worktree` subcommand (idempotent, see § Helper script) so no spawned worktree is missed even if the orchestrator dispatches multiple mini-agents over the PR's lifetime. Phase 6 housekeeping iterates this array to clean up — without it the mini-agent worktrees leak on disk because the orchestrator only ever recorded the implementing agent's path. The singular `worktree` field is retained alongside as diagnostic information ("which path was the implementing agent's"); it is not the source of truth for cleanup.
+
 The `digest_tail` keeps the last 50 progress-digest lines so a `--resume` reattachment can show the user where the run was last time without re-polling GitHub.
 
 ### Helper script
@@ -305,6 +311,7 @@ Subcommands:
 | `get <id>` | Phase 1 (`--resume`) → print the state file, or exit 1 if missing. |
 | `path <id>` | Print the absolute path (whether or not the file exists). |
 | `update-issue <id> <issue#> <new-state> [<key=value> ...]` | Phase 5 / Phase 6 → flip per-issue state and patch dispatch-context fields. Allow-listed keys: `branch`, `worktree`, `pr_number`, `pr_url`, `agent_id`, `blocked_question`, `paused_reason`, `errored_reason`, `body_snapshot`, `labels_snapshot`. Allow-listed `<new-state>` values: `scheduled`, `in-progress`, `automerge_set`, `merged`, `blocked`, `paused`, `errored`, `externally_closed`. |
+| `add-worktree <id> <issue#> <path>` | Phase 5 / Phase 5b → append `<path>` to `issues[<issue#>].worktrees`. Idempotent — re-adding a path the array already contains is a no-op. The orchestrator calls this immediately after parsing each `isolation: worktree`-dispatched agent's terminal notification, so Phase 6 housekeeping can iterate every worktree spawned during the PR's lifecycle. |
 | `append-digest <id> <line>` | Phase 5 progress reporting → append a digest line to `digest_tail` (capped at 50 entries). |
 | `list` | `--session list` → enumerate every state file with ID, repo, last-modified timestamp, selector summary, in-flight count. |
 | `delete <id>` | Phase 8 → remove the state file once every issue is terminal. |
@@ -532,7 +539,7 @@ Loop until every issue is terminal (merged, parked, or excluded):
      "$session_id" <issue#> <new-state> [branch=... worktree=... pr_number=... pr_url=... agent_id=... blocked_question=... paused_reason=... errored_reason=...]
    ```
 
-   - On dispatch (Phase 5 step 4): `update-issue <id> <n> in-progress branch=<b> worktree=<wt> agent_id=<harness-agent-id>`. The `agent_id` is the harness's identifier for the dispatched agent, used by Phase 5 step 5's review-result routing (`SendMessage(<agent_id>, ...)`) and by the malformed-terminal recovery probe (Branch 3) to decide whether to message the warm agent or fall back to dispatching the address-review mini-agent fresh.
+   - On dispatch (Phase 5 step 4): `update-issue <id> <n> in-progress branch=<b> worktree=<wt> agent_id=<harness-agent-id>`. The `agent_id` is the harness's identifier for the dispatched agent, used by Phase 5 step 5's review-result routing (`SendMessage(<agent_id>, ...)`) and by the malformed-terminal recovery probe (Branch 3) to decide whether to message the warm agent or fall back to dispatching the address-review mini-agent fresh. Immediately after parsing the agent's terminal notification (or `READY_FOR_REVIEW` heartbeat — whichever comes first), also append the agent's worktree path to the lifecycle-spanning `worktrees` array via `add-worktree <id> <n> <wt>` so Phase 6 can clean it up alongside any mini-agent worktrees that get spawned later. (`add-worktree` is idempotent, so it is safe to call on every notification from the same agent.)
    - On the implementing agent's `READY_FOR_REVIEW` heartbeat: `update-issue <id> <n> in-progress pr_number=<p> pr_url=<u>` (state stays `in-progress`; only the dispatch context advances; `agent_id` stays populated because the agent is paused awaiting `SendMessage`, not terminated).
    - On the implementing agent's `READY_TO_MERGE` terminal: `update-issue <id> <n> in-progress agent_id=` (the warm agent has terminated; clear `agent_id` so the malformed-terminal probe doesn't try to `SendMessage` a gone agent on a future tick). The orchestrator then runs the merge handoff — see automerge-gate below.
    - On automerge set (the orchestrator runs the merge handoff after the warm agent's `READY_TO_MERGE` return): `update-issue <id> <n> automerge_set`.
@@ -541,6 +548,7 @@ Loop until every issue is terminal (merged, parked, or excluded):
    - On `PAUSED`: `update-issue <id> <n> paused paused_reason="<reason>" agent_id=`. Clear `agent_id` (the agent terminated).
    - On `ERRORED`: `update-issue <id> <n> errored errored_reason="<error>" agent_id=`. Clear `agent_id` (the agent terminated).
    - On `externally_closed` (parked-issue poll observed `state == CLOSED`): `update-issue <id> <n> externally_closed`. No further state-file fields are required — the existing `blocked_question` survives in the file as the audit trail of what the issue had been parked on before it was closed externally; `agent_id` was already cleared when the issue parked on `BLOCKED`.
+   - **On every `isolation: worktree` mini-agent terminal** (Phase 5 step 5's address-review fallback dispatch and every Phase 5b mini-agent — conflict-resolution / CI-failure-fix / review-comment): `add-worktree <id> <n> <wt>` against the path the mini-agent's terminal notification carried. This is independent of the state transitions above (the per-issue `state` does not change when a mini-agent finishes), and is what lets Phase 6 housekeeping clean up every spawned worktree rather than just the implementing agent's. The implementing agent's path is appended via the same call on Phase 5 step 4 (covered above). Re-appending the same path is a no-op, so the orchestrator can call this on every notification without tracking what it has already recorded.
 
    Treat the state-file write as part of the transition, not a follow-up: a Claude Code crash *between* the transition and the file write would leave the orchestrator and the file out of sync, which is the exact failure mode `--resume` is meant to prevent.
 
@@ -1488,7 +1496,9 @@ When the orchestrator observes a `MERGED` event from the Phase 5b shell monitor 
 
    GitHub's auto-close-on-`Closes #N` is unreliable for App-token-mediated API merges (observed in repos using a merge-bot pattern with bypass-actor App tokens). Don't wait for it; verify and close yourself.
 
-3. **Remove the worktree** at the path returned in the agent's notification. The existing `/close-worktree` skill encapsulates this — `cd` out of the worktree, `git worktree remove --force <path>`, then `git worktree prune`, then `cd` back to the repo root. Reuse that skill rather than re-deriving the steps. This step is required: `isolation: worktree` only auto-cleans when the agent made no changes, and a successful run always makes changes — so without explicit removal, every merged PR leaves a locked worktree under `.claude/worktrees/agent-<id>/` that grows disk and inode cost monotonically. The trailing `cd` back to the repo root is required for a different reason: if the orchestrator's bash session ever `cd`'d into the removed worktree earlier in the run (e.g. to push an empty commit, manually resolve `BEHIND`, or check git state), its CWD is now dangling and subsequent `git`/`gh` calls in that session fail with cryptic config-read errors.
+3. **Remove every spawned worktree.** Read the lifecycle-spanning `worktrees` array from the state file (`session-state.sh get <id> | jq -r '.issues["<n>"].worktrees // [] | .[]'`) and iterate, running `git worktree remove -f -f <path>` for each. Then `git worktree prune` once. Then `cd <repo-root>`. The `// []` fallback is symmetric with `add-worktree`'s `(.worktrees // [])` write — a state file written before this field existed (pre-#102 `--resume`) iterates as zero paths instead of crashing on `Cannot iterate over null`. The double-`-f` is intentional and load-bearing — the harness occasionally still holds locks on a mini-agent's worktree at the moment Phase 6 runs (observed across the 2026-05-01 `aidanns/agent-auth` run, where four leaked worktrees all required `git worktree remove -f -f` to clear). Always pass `-f -f`; do not first try `--force` and fall back. This step is required: `isolation: worktree` only auto-cleans when the agent made no changes, and a successful run always makes changes — so without explicit removal, every merged PR leaves a locked worktree per spawned agent (implementing + every mini-agent) under `.claude/worktrees/agent-<id>/` that grows disk and inode cost monotonically. The trailing `cd` back to the repo root is required for a different reason: if the orchestrator's bash session ever `cd`'d into a removed worktree earlier in the run (e.g. to push an empty commit, manually resolve `BEHIND`, or check git state), its CWD is now dangling and subsequent `git`/`gh` calls in that session fail with cryptic config-read errors.
+
+   The `worktrees` array is the source of truth here, not the singular `worktree` field — a PR's lifecycle commonly spawns more than one worktree (implementing agent + any conflict-resolution / CI-failure-fix / review-comment / address-review fallback mini-agents), and the singular field only ever held the implementing agent's path. Reading the array is what closes the leak.
 
 4. **Pick up the next eligible issue.** The `in-progress` label persists on the closed issue (intentional — preserves audit trail).
 
@@ -1505,13 +1515,23 @@ TaskUpdate(taskId: "<task-id-for-281>", status: "completed")
 # Group 2 — parallel cleanup. Failures here are recoverable; the task flip already landed.
 gh issue view 281 --json state
 gh issue close 281 --comment "..."        # only if step 2 found it OPEN
-git worktree remove --force <worktree-path>
+
+# Iterate every worktree the orchestrator spawned for this PR's lifecycle.
+# The array typically contains the implementing agent's path plus any
+# conflict-resolution / CI-failure-fix / review-comment / address-review
+# fallback mini-agent worktrees. The double-`-f` is required because the
+# harness sometimes still holds locks at cleanup time.
+while IFS= read -r wt; do
+  [[ -z "$wt" ]] && continue
+  git worktree remove -f -f "$wt"
+done < <(bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" get "$session_id" \
+         | jq -r '.issues["281"].worktrees // [] | .[]')
 git worktree prune
 cd <repo-root>                             # land in a known-good CWD post-removal
 git pull origin main                       # in the orchestrator's checkout
 ```
 
-The cleanup group can fail any of its calls without losing the task transition. Retry the failing call(s); the `TaskUpdate` is already done.
+The cleanup group can fail any of its calls without losing the task transition. Retry the failing call(s); the `TaskUpdate` is already done. A `git worktree remove -f -f` that fails because the path is already gone (e.g. the user manually purged a worktree mid-run) is recoverable too — `git worktree prune` at the end reconciles the registry against on-disk state.
 
 ### Why standalone TaskUpdate
 
@@ -1580,7 +1600,7 @@ bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" delete "$se
 
 Concretely: delete only when every issue is `merged`, `errored`, or `externally_closed`. Otherwise leave the file and let `--session list` surface it on the next invocation.
 
-A future `--session forget <id>` flag could expose the same `delete` subcommand for explicit cleanup of stuck-but-abandoned sessions; until then the user's manual escape hatch is `rm ~/.claude/state/workflow-implement/<id>.json` (or `bash session-state.sh delete <id>`).
+A future `--session forget <id>` flag could expose the same `delete` subcommand for explicit cleanup of stuck-but-abandoned sessions; until then the user's manual escape hatch is `rm ~/.claude/state/workflow-implement/<id>.json` (or `bash session-state.sh delete <id>`). When that flag lands, it must also iterate `issues[*].worktrees` and run `git worktree remove -f -f` against every entry before deleting the file — otherwise sessions abandoned mid-run (`BLOCKED` / `PAUSED` / orchestrator crash) would leak every spawned worktree they had recorded. Phase 6 housekeeping handles the steady-state path (worktrees drained per-issue on `MERGED`), so by the time Phase 8.1's GC fires on a clean run the array is mostly draining empty arrays — the iteration is a defensive backstop for the abandoned-mid-run case the manual escape hatch hits.
 
 After emitting the final-report message, fire one `PushNotification` summarising the run outcome — this is the bell for "the orchestration is done." Examples:
 
