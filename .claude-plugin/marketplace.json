@@ -17,6 +17,11 @@
       "name": "workflow",
       "description": "Workflow-automation skills (end-to-end GitHub issue execution; sibling skills planned)",
       "source": "./plugins/workflow"
+    },
+    {
+      "name": "simple-response",
+      "description": "Ultra-compressed response mode that drops filler while keeping technical accuracy.",
+      "source": "./plugins/simple-response"
     }
   ]
 }

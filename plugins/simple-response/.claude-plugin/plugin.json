@@ -1,0 +1,7 @@
+{
+  "name": "simple-response",
+  "description": "Ultra-compressed response mode that drops filler while keeping technical accuracy.",
+  "author": {
+    "name": "Aidan Nagorcka-Smith"
+  }
+}
