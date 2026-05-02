@@ -6,7 +6,7 @@ Engineering workflow skills covering domain-driven design, debugging discipline,
 
 | Skill | What it does |
 | --- | --- |
-| `setup-matt-pocock-skills` | Per-repo bootstrap: writes an `## Agent skills` block to `CLAUDE.md`/`AGENTS.md` and three docs under `docs/agents/` so the other skills know your issue tracker, triage labels, and domain-doc layout. Run once per repo. |
+| `setup` | Per-repo bootstrap: writes an `## Agent skills` block to `CLAUDE.md`/`AGENTS.md` and three docs under `docs/agents/` so the other skills know your issue tracker, triage labels, and domain-doc layout. Run once per repo. |
 | `diagnose` | Disciplined 6-phase debugging loop — feedback loop → reproduce → hypothesise → instrument → fix → cleanup. |
 | `grill-with-docs` | Stress-tests a plan by interviewing the user one question at a time, sharpening domain language and updating `CONTEXT.md` / ADRs inline. |
 | `improve-codebase-architecture` | Surfaces "deepening opportunities" (shallow → deep modules) using a deletion-test heuristic and a strict architectural glossary. |
@@ -23,7 +23,7 @@ Several skills (`to-issues`, `to-prd`, `triage`, and indirectly `diagnose` / `td
 - An **issue tracker** (GitHub by default) and **triage label vocabulary** (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`).
 - A **domain glossary** at `CONTEXT.md` and **ADRs** under `docs/adr/`.
 
-Run `setup-matt-pocock-skills` once per repo to scaffold these. The other skills will then read from `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md`, and `docs/agents/domain.md`.
+Run `/setup` once per repo to scaffold these. The other skills will then read from `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md`, and `docs/agents/domain.md`.
 
 ## Attribution
 
@@ -31,7 +31,7 @@ All skills in this plugin are adapted from [mattpocock/skills](https://github.co
 
 | Skill | Upstream source |
 | --- | --- |
-| `setup-matt-pocock-skills` | [`skills/engineering/setup-matt-pocock-skills`](https://github.com/mattpocock/skills/tree/main/skills/engineering/setup-matt-pocock-skills) |
+| `setup` (renamed from upstream `setup-matt-pocock-skills`) | [`skills/engineering/setup-matt-pocock-skills`](https://github.com/mattpocock/skills/tree/main/skills/engineering/setup-matt-pocock-skills) |
 | `diagnose` | [`skills/engineering/diagnose`](https://github.com/mattpocock/skills/tree/main/skills/engineering/diagnose) |
 | `grill-with-docs` | [`skills/engineering/grill-with-docs`](https://github.com/mattpocock/skills/tree/main/skills/engineering/grill-with-docs) |
 | `improve-codebase-architecture` | [`skills/engineering/improve-codebase-architecture`](https://github.com/mattpocock/skills/tree/main/skills/engineering/improve-codebase-architecture) |
