@@ -1,0 +1,7 @@
+{
+  "name": "engineering",
+  "description": "Engineering workflow skills (setup, diagnose, TDD, grill-with-docs, improve-codebase-architecture, to-prd, to-issues, triage, zoom-out) adapted from Matt Pocock's skills repo.",
+  "author": {
+    "name": "Aidan Nagorcka-Smith"
+  }
+}

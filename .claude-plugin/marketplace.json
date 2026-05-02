@@ -22,6 +22,11 @@
       "name": "simple-response",
       "description": "Ultra-compressed response mode that drops filler while keeping technical accuracy.",
       "source": "./plugins/simple-response"
+    },
+    {
+      "name": "engineering",
+      "description": "Engineering workflow skills (setup, diagnose, TDD, grill-with-docs, improve-codebase-architecture, to-prd, to-issues, triage, zoom-out) adapted from mattpocock/skills.",
+      "source": "./plugins/engineering"
     }
   ]
 }
