@@ -999,9 +999,9 @@ When step 5 of the Phase 5 execution loop sets automerge (after the warm impleme
 
 The monitor is a single bash script. Stdout lines are events; the orchestrator routes each event line to the appropriate handler. Stderr is for the script's own diagnostics (logged but not interpreted as events).
 
-Save as `monitor-pr.sh` (or paste inline into the `Monitor` tool's command — both work). Invocation: `monitor-pr.sh <pr#> <pr-branch> <repo-base-branch>` (e.g. `monitor-pr.sh 451 aidanns/foo-fix main`).
+Paste inline into the `Monitor` tool's command (the orchestrator dispatches it from a context where `$CLAUDE_PLUGIN_ROOT` is exported). Invocation form: `monitor-pr.sh <pr#> <pr-branch> <repo-base-branch>` (e.g. `monitor-pr.sh 451 aidanns/foo-fix main`). The recipe is **not** self-contained — it shells out to a colocated helper for the BEHIND auto-resolve (see next paragraph) — so saving it as a standalone `monitor-pr.sh` and running it outside the orchestrator only works if you also export `CLAUDE_PLUGIN_ROOT` to point at this plugin's checkout.
 
-The BEHIND auto-resolve subroutine is factored out into `scripts/monitor-behind-resolve.sh` (colocated with this skill at `$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/monitor-behind-resolve.sh`) so its upstream-step error handling is unit-testable. The outer monitor below shells out to it on each BEHIND tick.
+The BEHIND auto-resolve subroutine is factored out into `scripts/monitor-behind-resolve.sh` (colocated with this skill at `$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/monitor-behind-resolve.sh`) so its upstream-step error handling is unit-testable. The outer monitor below shells out to it on each BEHIND tick. The recipe asserts `$CLAUDE_PLUGIN_ROOT` is set on entry so the failure mode is a single targeted error message rather than a `bash: /skills/implement/scripts/monitor-behind-resolve.sh: No such file or directory` from the substitution producing an empty path.
 
 ```bash
 #!/usr/bin/env bash
@@ -1009,6 +1009,12 @@ The BEHIND auto-resolve subroutine is factored out into `scripts/monitor-behind-
 # Phase 5b shell monitor: drive a PR to merge, escalating to mini-agents on judgment cases.
 #
 set -uo pipefail  # NOT -e: a single failed gh call shouldn't kill the loop.
+
+# The BEHIND auto-resolve shells out to a helper colocated with this skill;
+# fail loudly here if the env var that resolves it is not set rather than
+# letting `bash ""/skills/implement/scripts/...` produce a confusing
+# no-such-file error on every BEHIND tick.
+: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set; the BEHIND auto-resolve helper is colocated with this skill at \$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/monitor-behind-resolve.sh}"
 
 pr="${1:?pr number required}"
 branch="${2:?pr branch required}"

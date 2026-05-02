@@ -27,7 +27,14 @@
 # on subsequent ones so the orchestrator gets exactly one MONITOR_DEGRADED per
 # `<step>:<pr>` per session.
 
-set -uo pipefail  # NOT -e: we surface failures as events, not exit codes.
+set -uo pipefail
+# NOTE: Deliberate deviation from the project bash convention `set -euo
+# pipefail` (documented in `~/.claude/CLAUDE.md`). `-e` is omitted because
+# the helper's contract is to capture non-zero exit codes from `gh` / `git`
+# and surface them as `MONITOR_DEGRADED` / `BEHIND_RESOLVE_FAILED` event
+# lines. Re-adding `-e` would silently break the failure-surfacing contract
+# -- the script would die on the first `gh` failure rather than emitting
+# the corresponding event. Do not "fix" this back to `-euo pipefail`.
 
 pr="${1:?pr number required}"
 branch="${2:?pr branch required}"

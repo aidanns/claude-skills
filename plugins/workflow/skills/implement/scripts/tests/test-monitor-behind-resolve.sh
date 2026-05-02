@@ -82,6 +82,17 @@ case "$1 $2" in
       printf 'gh repo clone: permission denied\n' >&2
       exit 1
     fi
+    # The 3rd positional is the repo argument the helper interpolated from
+    # `gh repo view`. If the view stub failed, the captured stderr ends up
+    # here as a bogus repo name -- mirror real `gh repo clone` and reject
+    # anything that does not look like `owner/repo`. This is what makes the
+    # gh-repo-view-folded-into-clone contract actually observable in the
+    # test fixture.
+    repo_arg="$3"
+    if [[ ! "$repo_arg" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+      printf 'gh repo clone: invalid repository %q\n' "$repo_arg" >&2
+      exit 1
+    fi
     # Success: create a `repo` dir so the helper's `cd repo` succeeds.
     mkdir -p repo
     cd repo
@@ -118,7 +129,11 @@ case "\$1" in
     exit 0
     ;;
   merge)
-    if [[ "\$2" == "--abort" ]]; then exit 0; fi
+    if [[ "\$2" == "--abort" ]]; then
+      # Record the abort call so tests can assert it was invoked.
+      : >"\${state_dir}/merge_aborted"
+      exit 0
+    fi
     mode="\$(cat "\${state_dir}/merge_mode" 2>/dev/null || echo ok)"
     case "\$mode" in
       ok)       exit 0 ;;
@@ -227,6 +242,12 @@ rm -rf "$sandbox"
 # through to the outer loop's CONFLICT path on the next tick. This is the
 # key contract distinguishing "auto-resolve degraded" from "auto-resolve
 # decided not to escalate this tick".
+#
+# Also pin two adjacent contracts that a future regression could quietly
+# break: (1) `git merge --abort` is invoked so the working tree is clean
+# for the next tick, and (2) the dedupe file stays empty so a transient
+# conflict does not consume the `merge:<pr>` slot and silently swallow a
+# later hard-merge-error event for the same PR.
 sandbox=$(make_sandbox)
 dedupe="$sandbox/dedupe"; : >"$dedupe"
 printf 'conflict\n' >"$sandbox/state/merge_mode"
@@ -236,6 +257,15 @@ assert_not_contains "merge-conflict tick does NOT emit MONITOR_DEGRADED" \
   "MONITOR_DEGRADED" "$out"
 assert_not_contains "merge-conflict tick does NOT emit BEHIND_RESOLVED either" \
   "BEHIND_RESOLVED" "$out"
+if [[ -f "$sandbox/state/merge_aborted" ]]; then
+  abort_called=true
+else
+  abort_called=false
+fi
+assert_eq "merge-conflict tick calls git merge --abort" \
+  "true" "$abort_called"
+assert_eq "merge-conflict tick leaves dedupe file untouched" \
+  "" "$(cat "$dedupe")"
 rm -rf "$sandbox"
 
 # --- Test 6: success path emits BEHIND_RESOLVED, no MONITOR_DEGRADED.
@@ -263,6 +293,24 @@ assert_contains "BEHIND_RESOLVE_FAILED reason includes captured stderr" \
   "workflow" "$out"
 assert_not_contains "push failure does NOT emit MONITOR_DEGRADED" \
   "MONITOR_DEGRADED" "$out"
+rm -rf "$sandbox"
+
+# --- Test 8: `gh repo view` failure surfaces as MONITOR_DEGRADED clone.
+# Pins the design decision documented in the PR body: `gh repo view` is
+# folded into the `clone` step because the view call is an argument
+# substitution to clone -- if view fails the clone arg is corrupt and the
+# clone fails, capturing both. `clone_mode=ok` here so the clone-stub-side
+# explicit-fail path is NOT what surfaces the failure -- it has to come
+# from the view-corrupted repo arg flowing into the clone.
+sandbox=$(make_sandbox)
+dedupe="$sandbox/dedupe"; : >"$dedupe"
+printf 'fail\n' >"$sandbox/state/view_mode"
+out=$(run_helper "$sandbox" 951 feature/v main "$dedupe" 2>&1)
+
+assert_contains "gh repo view failure surfaces as MONITOR_DEGRADED clone" \
+  "MONITOR_DEGRADED 951 clone" "$out"
+assert_contains "view-via-clone failure reason carries the clone-side stderr" \
+  "invalid repository" "$out"
 rm -rf "$sandbox"
 
 if (( failed != 0 )); then
