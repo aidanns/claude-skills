@@ -755,7 +755,7 @@ Apply this filter before relaying any event to the user:
 - Orchestrator-level review subagent finished: `LGTM` (review state moves to `done (LGTM)`) or `FINDINGS <count>` (review state moves to `done (<count> findings)`).
 - Address-review fallback mini-agent terminal return (rare — only on the warm-agent-unreachable path): `READY_TO_MERGE` (orchestrator is about to set automerge).
 - Orchestrator sets automerge (the warm agent's `READY_TO_MERGE` return — or, in the fallback path, the address-review mini-agent's `READY_TO_MERGE` — fires the merge handoff per the observed `Merge mechanism:` line) — this is the "merging" state in the state machine.
-- Phase 5b shell-monitor events: `MERGED`, `CLOSED` (PR closed without merging — surface so the user notices the run won't reach all-terminal), `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `BEHIND_RESOLVE_FAILED` (the monitor's `git push` was rejected after a local catch-up — usually a PAT-scope issue; the PR is parked until the user intervenes), `STALLED_GREEN` (the merge bot didn't fire after CI went green; the orchestrator is running the tier 2 / 3 / 4 ladder).
+- Phase 5b shell-monitor events: `MERGED`, `CLOSED` (PR closed without merging — surface so the user notices the run won't reach all-terminal), `CONFLICT`, `CI_FAILURE`, `NEW_COMMENT`, `BEHIND_RESOLVE_FAILED` (the monitor's `git push` was rejected after a local catch-up — usually a PAT-scope issue; the PR is parked until the user intervenes), `MONITOR_DEGRADED` (an upstream step of the BEHIND auto-resolve — `clone` / `fetch` / `merge` — failed, so the auto-resolve can't proceed; the PR is parked until the upstream issue clears or the user intervenes; deduped to once-per-`<step>:<pr>` per session so persistent failures don't spam chat), `STALLED_GREEN` (the merge bot didn't fire after CI went green; the orchestrator is running the tier 2 / 3 / 4 ladder).
 - Phase 5b mini-agent terminal returns: `RESOLVED` (conflict-resolution), `FIXED` (CI-failure-fix), `ADDRESSED` (review-comment), `ENVIRONMENTAL` (CI-failure-fix flake/infra).
 - A new check `conclusion == "FAILURE"` newly observed in the rollup (the digest's `CI: red` count goes up).
 - A new merge conflict newly observed (`mergeStateStatus == "DIRTY"` newly seen — the digest's `merge: conflict` first appears).
@@ -1001,6 +1001,8 @@ The monitor is a single bash script. Stdout lines are events; the orchestrator r
 
 Save as `monitor-pr.sh` (or paste inline into the `Monitor` tool's command — both work). Invocation: `monitor-pr.sh <pr#> <pr-branch> <repo-base-branch>` (e.g. `monitor-pr.sh 451 aidanns/foo-fix main`).
 
+The BEHIND auto-resolve subroutine is factored out into `scripts/monitor-behind-resolve.sh` (colocated with this skill at `$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/monitor-behind-resolve.sh`) so its upstream-step error handling is unit-testable. The outer monitor below shells out to it on each BEHIND tick.
+
 ```bash
 #!/usr/bin/env bash
 #
@@ -1020,6 +1022,14 @@ emit() { printf '%s\n' "$*"; }  # one event per line, line-buffered by default.
 # don't re-emit on every tick.
 seen_failures=""   # space-separated run IDs.
 seen_comments=""   # space-separated comment IDs.
+
+# Dedupe file for MONITOR_DEGRADED events emitted by the BEHIND auto-resolve
+# helper. The helper runs in its own process (so a bash variable wouldn't
+# survive across ticks anyway), and the BEHIND auto-resolve runs in a
+# subshell here -- a tempfile is the simplest way for the dedupe state to
+# span both boundaries. Each line in the file is a `<step>:<pr>` marker.
+degraded_dedupe=$(mktemp)
+trap 'rm -f "$degraded_dedupe"' EXIT
 
 # Track "time since the PR's observable state last changed" so we can detect
 # the steady-state "green + automerge applied + open + mergeable" stall and
@@ -1068,35 +1078,13 @@ while :; do
   fi
 
   # ---- BEHIND + MERGEABLE: auto-resolve in-shell (no LLM). ----
-  # Automerge does NOT auto-update behind branches. We catch it up locally.
+  # Automerge does NOT auto-update behind branches. We catch it up locally
+  # via the helper, which also surfaces upstream-step failures (clone /
+  # fetch / merge) as MONITOR_DEGRADED so a broken auto-resolve doesn't
+  # silently loop the BEHIND state forever.
   if [[ "$msstatus" == "BEHIND" && "$mergeable" != "CONFLICTING" ]]; then
-    (
-      tmpdir=$(mktemp -d)
-      cd "$tmpdir"
-      gh repo clone "$(gh repo view --json nameWithOwner -q .nameWithOwner)" repo -- --branch "$branch" --depth 50 >/dev/null 2>&1 || exit 0
-      cd repo
-      git fetch origin "$base" >/dev/null 2>&1 || exit 0
-      if git merge --no-edit "origin/$base" >/dev/null 2>&1; then
-        # Capture push stderr so we can surface failures (e.g. PAT missing
-        # `workflow` scope rejecting changes under `.github/workflows/*`).
-        # Only emit BEHIND_RESOLVED when the push actually landed; otherwise
-        # the next tick would observe BEHIND again and silently loop.
-        push_err=$(git push origin "$branch" 2>&1 >/dev/null)
-        push_rc=$?
-        if [[ $push_rc -eq 0 ]]; then
-          emit "BEHIND_RESOLVED $pr"
-        else
-          # Collapse newlines/tabs so the event line stays single-line.
-          reason=$(printf '%s' "$push_err" | tr '\n\t' '  ' | sed 's/  */ /g')
-          emit "BEHIND_RESOLVE_FAILED $pr $reason"
-        fi
-      else
-        # The merge produced conflicts — escalate via the CONFLICT path below
-        # on the next tick (don't double-emit here).
-        git merge --abort >/dev/null 2>&1 || true
-      fi
-      rm -rf "$tmpdir"
-    )
+    bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/monitor-behind-resolve.sh" \
+      "$pr" "$branch" "$base" "$degraded_dedupe"
   fi
 
   # ---- DIRTY / CONFLICTING: escalate to conflict-resolution mini-agent. ----
@@ -1181,6 +1169,7 @@ Key behaviours:
 
 - **`BEHIND` auto-resolution stays in-shell.** Uses the same local-merge approach the implementing agent uses (`git fetch origin main && git merge --no-edit origin/main && git push`) — no `update-branch` API call, consistent with the rest of this skill.
 - **Push failures are surfaced, not swallowed.** `git push` stderr is captured and the exit code is checked. On failure, the monitor emits `BEHIND_RESOLVE_FAILED <pr#> <reason>` instead of `BEHIND_RESOLVED`, so a silently-rejected push (e.g. PAT missing `workflow` scope on `.github/workflows/*` changes) escalates to the user instead of the next tick re-observing BEHIND and looping. `BEHIND_RESOLVED` is only emitted when the push actually landed.
+- **Upstream-step failures are surfaced, not swallowed.** The `gh repo clone` / `git fetch` / `git merge` steps that precede the push each capture their stderr and emit `MONITOR_DEGRADED <pr#> <step> <reason>` on failure (where `<step>` is `clone` / `fetch` / `merge`). Without this surfacing, a broken auto-resolve (e.g. `gh repo view` failing in the monitor's tmpdir, a stale clone token, an unrelated-histories merge error) was invisible to the orchestrator: BEHIND would persist for poll after poll with no event, no `BEHIND_RESOLVED`, no `BEHIND_RESOLVE_FAILED`, and the user had to diagnose by hand. Each `<step>:<pr>` combination emits at most once per monitor session (dedupe lives in the `degraded_dedupe` tempfile) so a persistent failure surfaces exactly once. `gh repo view` is folded into the `clone` step because the view call is a substitution argument to the clone — if view fails the clone fails, and capturing the clone stderr captures both. A `git merge` that produces conflicts (rather than a hard merge error) is *not* surfaced as `MONITOR_DEGRADED merge` — it falls through to the next tick's CONFLICT path so the conflict-resolution mini-agent gets dispatched, same as before.
 - **Transient `gh` failures** (network blips, rate-limit retries) don't crash the loop — `|| true` and an empty-result check keep polling.
 - **Deduplication** — failing run IDs and review comment IDs are tracked, so a persistent failure escalates exactly once per ID, not on every tick.
 - **`Claude` -prefixed comments are skipped** so the monitor doesn't re-escalate on the implementing agent's or reviewer subagent's own comments.
@@ -1198,6 +1187,7 @@ The `Monitor` tool surfaces each stdout line of `monitor-pr.sh` as a notificatio
 | `CLOSED <pr-url>` | Surface to user — PR was closed without merging. Stop the monitor. |
 | `BEHIND_RESOLVED <pr#>` | Log only. Refresh the next progress digest. |
 | `BEHIND_RESOLVE_FAILED <pr#> <reason>` | Surface to user — the monitor caught up the branch locally but the `git push` was rejected (commonly a PAT-scope issue, e.g. missing `workflow` scope when the PR touches `.github/workflows/*`). Stop the monitor; treat the PR as parked until the user resolves the auth/permission issue. Do **not** loop — the next tick would just re-observe BEHIND and fail the same way. |
+| `MONITOR_DEGRADED <pr#> <step> <reason>` | Surface to user — an upstream step (`<step>` is `clone` / `fetch` / `merge`) of the BEHIND auto-resolve failed, so the auto-resolve cannot complete. Park the PR (treat as user-attention-needed; the BEHIND state will persist until either the upstream issue clears or the user intervenes). The monitor keeps polling — the failure may self-recover (e.g. transient `gh` network blip, stale tmpdir CWD that becomes valid again next tick) and each `<step>:<pr>` is deduplicated so a persistent failure produces exactly one event per monitor session, not one per tick. Optionally `update-issue <id> <n> errored` if the step failure looks non-recoverable from the reason text (clone permission denied, repo not found, etc.). Distinct from `BEHIND_RESOLVE_FAILED`, which surfaces a *push*-specific rejection after the upstream steps succeeded. |
 | `CONFLICT <pr#> <branch> <base> <files>` | Dispatch the **conflict-resolution mini-agent** (template below). |
 | `CI_FAILURE <pr#> <check> <run-id>` | Size the fix first (see **CI-failure sizing rule** below). If ≤50 lines / 1-2 files, fix in-place at the orchestrator level. Otherwise dispatch the **CI-failure-fix mini-agent** (template below). |
 | `NEW_COMMENT <pr#> <comment-id>` | Dispatch the **review-comment mini-agent** (template below). |
