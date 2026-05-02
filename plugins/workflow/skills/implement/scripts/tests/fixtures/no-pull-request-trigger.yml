@@ -1,0 +1,14 @@
+# Negative fixture: workflow does not subscribe to `pull_request: labeled`
+# at all. The detector must reject it before label-guard extraction.
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "nightly"

@@ -1,0 +1,19 @@
+# Negative fixture: the workflow listens for `labeled` events but its if
+# expression accepts every label change indiscriminately. The detector must
+# NOT extract a candidate label here, otherwise it would mis-emit the
+# label-bot trailer for a repo that doesn't actually use a label-triggered
+# merge bot. (The comment intentionally avoids quoting the guard syntax so
+# the regex doesn't match prose.)
+
+name: Label Audit
+
+on:
+  pull_request:
+    types: [labeled, unlabeled]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - run: echo "audit any label change"

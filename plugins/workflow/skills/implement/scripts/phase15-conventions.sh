@@ -10,6 +10,62 @@
 
 set -euo pipefail
 
+# --- Pure-text workflow predicates ------------------------------------------
+#
+# These two helpers are separated from the network-touching main flow so the
+# regression test (`tests/test-phase15-conventions.sh`) can exercise them
+# directly against fixture files. Keep them stdin-driven so the test can pipe
+# in a fixture without a tempfile dance.
+
+# Does this workflow listen for `pull_request: types: [..., labeled, ...]`?
+#
+# Handles both YAML list shapes that GitHub Actions accepts:
+#   - inline flow:  types: [labeled]   /   types: [opened, labeled]
+#   - block list:   types:
+#                     - labeled
+#
+# The previous heuristic only recognised the block form because it anchored
+# on a leading `-` at line start. `merge-bot.yml`-shaped workflows that use
+# the inline flow form (`types: [labeled]`) silently fell through and were
+# excluded from the merge-mechanism candidate set, even though they were the
+# very files that should have triggered the label-bot branch.
+phase15_workflow_listens_to_labeled() {
+  local content="$1"
+  # Inline flow list: `types: [..., labeled, ...]`. The character class lets
+  # us match across whitespace inside the brackets without having to handle
+  # multi-line flow lists (GitHub Actions workflows in the wild keep the
+  # flow form on a single line).
+  if grep -qE 'types:[[:space:]]*\[[^]]*\blabeled\b[^]]*\]' <<<"$content"; then
+    return 0
+  fi
+  # Block list: a `- labeled` entry on its own line.
+  if grep -qE '^[[:space:]]*-[[:space:]]+labeled[[:space:]]*$' <<<"$content"; then
+    return 0
+  fi
+  return 1
+}
+
+# Extract the first label name guarded by an `if:` in this workflow.
+#
+# Recognises the two shapes the merge-bot patterns use:
+#   if: github.event.label.name == 'automerge'
+#   if: contains(github.event.pull_request.labels.*.name, 'automerge')
+#
+# Both shapes work when buried inside a multi-line `if:` block joined by
+# `||` clauses (e.g. `merge-bot.yml`'s primary trigger gate) — the regex
+# is whitespace-tolerant and content-anchored, not line-anchored.
+phase15_extract_label_guard() {
+  local content="$1"
+  grep -oE "(label\.name[[:space:]]*==[[:space:]]*'[^']+'|labels\.\\*\\.name,[[:space:]]*'[^']+')" \
+    <<<"$content" | grep -oE "'[^']+'" | head -1 | tr -d "'" || true
+}
+
+# When sourced (e.g. by the regression test), expose only the helpers. Skip
+# argument parsing and all `gh api` calls so the test runs offline.
+if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]]; then
+  return 0
+fi
+
 repo="${1:?repo required, e.g. aidanns/claude-skills}"
 
 # --- Sample: most recent merged PRs -----------------------------------------
@@ -178,17 +234,9 @@ if [[ -n "$workflows" ]]; then
       --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
     [[ -z "$wf_content" ]] && continue
 
-    # Listens to `pull_request: types: [..., labeled, ...]`?
-    if ! grep -qE '^[[:space:]]*-?[[:space:]]*labeled([[:space:]]|$|,)' \
-        <<<"$wf_content"; then
-      continue
-    fi
+    phase15_workflow_listens_to_labeled "$wf_content" || continue
 
-    # Extract a label name from the workflow's `if:` guard. Common shapes:
-    #   if: github.event.label.name == 'automerge'
-    #   if: contains(github.event.pull_request.labels.*.name, 'automerge')
-    label=$(grep -oE "(label\.name[[:space:]]*==[[:space:]]*'[^']+'|labels\.\\*\\.name,[[:space:]]*'[^']+')" \
-      <<<"$wf_content" | grep -oE "'[^']+'" | head -1 | tr -d "'" || true)
+    label=$(phase15_extract_label_guard "$wf_content")
     if [[ -n "$label" ]]; then
       candidate_label="$label"
       break
