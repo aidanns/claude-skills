@@ -33,6 +33,18 @@
 #       closed externally while in `blocked` — it qualifies for Phase 8
 #       garbage collection alongside merged/errored.)
 #
+#   add-worktree <id> <issue#> <path>
+#       Append <path> to issues[<issue#>].worktrees if not already present.
+#       Idempotent — re-adding a path the array already contains is a no-op.
+#       The orchestrator calls this immediately after parsing each
+#       isolation:worktree-dispatched agent's terminal notification, so Phase 6
+#       housekeeping can iterate every worktree spawned during the PR's
+#       lifecycle (implementing agent + any conflict-resolution / CI-failure
+#       /review-comment / address-review mini-agents) without leaking them.
+#       The singular `worktree` field set via `update-issue` is retained for
+#       diagnostic value (it identifies which path was the implementing
+#       agent's); cleanup reads the plural `worktrees` array.
+#
 #   append-digest <id> <digest-line>
 #       Append <digest-line> to the progress-digest tail. The tail is capped
 #       at the most recent 50 entries to keep the file bounded.
@@ -70,6 +82,7 @@ Usage:
   session-state.sh get    <id>
   session-state.sh path   <id>
   session-state.sh update-issue <id> <issue#> <new-state> [<key=value> ...]
+  session-state.sh add-worktree <id> <issue#> <path>
   session-state.sh append-digest <id> <digest-line>
   session-state.sh list
   session-state.sh delete <id>
@@ -123,6 +136,7 @@ cmd_init() {
                     state: "scheduled",
                     branch: null,
                     worktree: null,
+                    worktrees: [],
                     pr_number: null,
                     pr_url: null,
                     agent_id: null,
@@ -219,6 +233,49 @@ cmd_update_issue() {
   mv "$tmp" "$path"
 }
 
+cmd_add_worktree() {
+  local id="${1:?id required}" issue="${2:?issue# required}"
+  # Use a default so an unset $3 (no positional) and an explicitly-empty
+  # $3 take separate branches: missing-args mirrors the `${var:?}` exit-1
+  # convention used elsewhere in this script, while an empty string is a
+  # contract violation worth its own exit-2 ("you passed something
+  # nonsensical, here's why") so the caller can distinguish.
+  if (( $# < 3 )); then
+    printf 'session-state: 3: path required\n' >&2
+    exit 1
+  fi
+  local path="$3"
+  if [[ -z "$path" ]]; then
+    printf 'session-state: add-worktree path must be non-empty\n' >&2
+    exit 2
+  fi
+
+  local file
+  file=$(state_path "$id")
+  require_file "$file"
+  local now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  # Append idempotently. If the issue record is missing, materialise a
+  # minimal one (same convention as update-issue's `// {number: ...}`
+  # fallback) so a misordered call doesn't silently drop the path. If the
+  # `worktrees` field is missing (state file written before this field was
+  # added to `init`), initialise it as `[]` first.
+  local tmp
+  tmp=$(mktemp)
+  jq \
+    --arg issue "$issue" \
+    --arg path "$path" \
+    --arg now "$now" \
+    '.updated_at = $now
+     | .issues[$issue] = ((.issues[$issue] // {number: ($issue | tonumber)})
+                           | .worktrees = ((.worktrees // []) as $wt
+                                           | if ($wt | index($path)) then $wt
+                                             else $wt + [$path] end))' \
+    "$file" >"$tmp"
+  mv "$tmp" "$file"
+}
+
 cmd_append_digest() {
   local id="${1:?id required}" line="${2:?digest line required}"
   local path
@@ -287,6 +344,7 @@ main() {
     get)            cmd_get "$@" ;;
     path)           cmd_path "$@" ;;
     update-issue)   cmd_update_issue "$@" ;;
+    add-worktree)   cmd_add_worktree "$@" ;;
     append-digest)  cmd_append_digest "$@" ;;
     list)           cmd_list "$@" ;;
     delete)         cmd_delete "$@" ;;
