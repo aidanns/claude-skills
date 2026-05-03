@@ -9,6 +9,8 @@ Take one or more GitHub issues from intake to merge in a self-managing loop. Inv
 
 The skill is self-contained: every dispatched agent receives the full work pipeline in its prompt, so it does not require the host project's `CLAUDE.md` to define the workflow. Project-level docs (`CLAUDE.md`, `.claude/instructions/*.md`, `CONTRIBUTING.md`) are consulted by the agent for project-specific conventions (language, tooling, commit-message scopes), but the orchestration logic and PR pipeline are defined here.
 
+The skill assumes `CLAUDE.md` links to the project's convention docs (commit-message style, contribution guide, prose / style rules). If `CLAUDE.md` does not link to those docs, the convention-check pass (see § Convention-loading protocol) will under-cover — add the links to `CLAUDE.md` to widen coverage rather than expecting the skill to discover the docs by other means.
+
 ## Invocation
 
 `/workflow:implement [<args>]`
@@ -103,6 +105,50 @@ If a label doesn't exist in the repo, create it once via `gh label create` (see 
 **Trigger-surface widening triggers retroactive CodeQL findings.** If your PR adds `workflow_run` or `pull_request_target` as a trigger to any workflow file, audit *every* `run:` block in that file for inline `${{ steps.* }}`, `${{ github.event.* }}`, or `${{ inputs.* }}` interpolations. CodeQL will treat values flowing from the new trigger as untrusted, and existing safe-looking interpolations become `js/actions/command-injection` findings. Convert affected interpolations to the `env:` block + `${VAR}` shell expansion pattern that the rest of the file likely already uses. Run the local CodeQL action if available, or expect a CI failure on first push.
 
 **CWD discipline — prefer absolute paths and `--repo <owner>/<repo>` over CWD-derived defaults.** A stranded CWD (the bash session sitting in a directory that has been moved or deleted) is a classic source of opaque `git`/`gh` errors — typically `git: fatal: unknown error occurred while reading the configuration files` or similar. The Phase 6 worktree removal is the most common trigger (the orchestrator may have `cd`'d into the worktree earlier to push an empty commit, manually resolve `BEHIND`, or check git state, and the cleanup then deletes that directory under it), but anything that moves or removes a directory the bash session is sitting in produces the same failure mode. Two-pronged defence: (a) Phase 6 step 3 ends with a `cd` back to the repo root so the next command lands in a known-good CWD, and (b) the orchestrator should otherwise prefer absolute paths and explicit `--repo <owner>/<repo>` flags on `gh` calls — and `git -C <abs-path>` for `git` — rather than relying on CWD-derived defaults, so a stranded CWD degrades gracefully instead of producing cryptic errors.
+
+## Convention-loading protocol
+
+A reusable contract that every PR-touching agent runs before reviewing or addressing review findings on a PR. Defined once here and referenced by name from each call site (the implementing agent's pre-heartbeat self-review, the orchestrator-dispatched review subagent, and the address-review mini-agent fallback) so the three sites cannot drift apart. Originating context: `aidanns/agent-auth` commits `a3df89b` and `9d0b063` landed on `main` despite explicit rules forbidding both in `.claude/instructions/commit-messages.md`, because no agent in the pipeline ever loaded that file or inspected the PR body where the violations lived.
+
+The protocol covers two reusable pieces — the doc-traversal contract (Module 1) and the PR-artefact triple (Module 2) — plus a consolidated check step (Module 3) that names what the agent does with both. Call sites cite this section by name and apply the modules to their own work product.
+
+### Module 1 — Convention doc traversal (depth-2 from `CLAUDE.md`, branch=PR HEAD)
+
+The traversal loads the project's prose / style / convention rules so they can be enforced on the PR's diff, title, and body. Steps, run on the PR branch's HEAD (not `main` — PRs that themselves modify `CLAUDE.md` must be reviewed against the conventions they propose to install):
+
+1. Read `CLAUDE.md` at the repo root on the PR branch's HEAD.
+2. Identify every markdown link or path-shaped reference in `CLAUDE.md` that points to a doc-shaped file (`.md`, `.rst`, `.txt`) **inside this repo**. Read each.
+3. From each of those, follow one more level of doc-shaped links — depth-2 from `CLAUDE.md`. Stop there.
+4. Always also read `CONTRIBUTING.md` at the repo root on the PR branch's HEAD if it exists, even if no link reaches it (belt-and-braces fallback for repos that haven't yet linked it from `CLAUDE.md`).
+5. Skip code paths, generated files, lockfiles, and external URLs. The traversal is for prose / convention docs only.
+
+The depth-2 bound is load-bearing: a `CLAUDE.md` whose link tree extends to depth 3+ does **not** pull files beyond depth 2. Without the bound a single review can pull dozens of doc files transitively.
+
+**Graceful degradation.** If `CLAUDE.md` does not exist, has zero doc-shaped links, and no `CONTRIBUTING.md` is present, the protocol completes without error — the convention check just has nothing to enforce beyond what the agent already knows. Do not fail the run.
+
+**Branch source.** Every read in Module 1 must source from the PR branch's HEAD, not `main`. For an in-flight implementing agent that is the working tree it already has checked out. For an orchestrator-dispatched subagent (review or address-review) that means `gh pr checkout <pr#>` first (or reading from the PR branch's tree on disk via `git show <pr-branch>:<path>` if the agent is not in a worktree on the PR branch).
+
+### Module 2 — PR-artefact triple (diff + title + body)
+
+The convention check applies to **three** artefacts, named portably so the contract works across repos with different PR-template conventions (some repos put the squash subject in the PR title; others embed a `==COMMIT_MSG==` block in the body; some put the commit message in the body; etc.):
+
+- **diff** — `gh pr diff <pr#>`
+- **title** — `gh pr view <pr#> --json title --jq .title`
+- **body** — `gh pr view <pr#> --json body --jq .body`
+
+The implementing agent's pre-heartbeat self-review already has its own diff in scope (`git diff main...HEAD`) and can fetch its own title / body from the PR it just opened with `gh pr view`. The orchestrator-dispatched subagents fetch all three explicitly.
+
+### Module 3 — Verification + reporting
+
+After the loads in Modules 1 and 2:
+
+1. Verify the diff, title, and body against the union of rules collected from Module 1's loads. Convention violations are **first-class findings** — do not skip a violation because it "seems minor" or "the diff looks fine apart from this prose issue". If the project documented the rule, enforce it.
+2. Treat commit-message-shape rules (e.g. brevity, bullet-shape rules, identifier backticking, lead-with-symptom causal ordering) as applying to the PR body and title, since most squash-merge workflows source the commit subject from the title and the commit body from the PR body.
+3. Convention findings are reported with the same `Claude Reviewer:` prefix as other review findings (when reported by the orchestrator-dispatched review subagent) so they thread through the existing warm-agent and address-review paths unchanged.
+
+### When to narrow scope (cost-conscious variant)
+
+The implementing agent's pre-heartbeat self-review (warm session, runs every PR) **may** narrow Module 1's scope to `CLAUDE.md` plus the most-relevant linked file when full depth-2 traversal would be wasteful — heuristic: file name contains `commit`, `contribut`, or `style`. The orchestrator-dispatched subagents (review and address-review fallback) **always** do the full depth-2 traversal — they have their own token budget and the high-leverage independent reviewer is the load-bearing convention-enforcement site.
 
 ## Phase 1 — Intake
 
@@ -1130,7 +1176,12 @@ The PR is open. **Open the PR, do a self-review pass, emit `READY_FOR_REVIEW <pr
 
 **Heartbeat, not terminal.** `READY_FOR_REVIEW` is now a *heartbeat*: you emit it, your turn stops, and the orchestrator's next `SendMessage` resumes you with the review result. You stay warm — you are still the implementing agent, your branch is still yours, and the design context behind the original implementation is still in your head where it belongs. Returning `READY_FOR_REVIEW` does **not** free your concurrency-cap slot; the slot frees when you return `READY_TO_MERGE` and the orchestrator runs the merge handoff.
 
-**Before heartbeating, do one last self-review pass on your own diff.** This is a code-quality step, not a review step — the orchestrator's review subagent is the independent reviewer. Re-read `git diff main...HEAD` and self-correct any obvious problems (dead code, unclear names, missing tests, scope creep, undocumented decisions). The earlier step 3 self-review covered pre-push; this is one more pass after the PR is up so you can address anything that only became visible in the PR view (e.g. a file you forgot to stage, a stray debug print). Push any fixes before heartbeating. **Don't iterate forever** — one pass; if you spot something genuinely contentious, leave it for the review subagent.
+**Before heartbeating, do one last self-review pass on your own diff, title, and body.** This is a code-quality + convention-check step, not a full independent review — the orchestrator's review subagent is the independent reviewer. The pass covers two things:
+
+1. **Code quality on the diff.** Re-read `git diff main...HEAD` and self-correct any obvious problems (dead code, unclear names, missing tests, scope creep, undocumented decisions). The earlier step 3 self-review covered pre-push; this is one more pass after the PR is up so you can address anything that only became visible in the PR view (e.g. a file you forgot to stage, a stray debug print).
+2. **Convention check on the diff, title, and body.** Run the **Convention-loading protocol** (see § Convention-loading protocol near the top of this skill — Modules 1 + 2 + 3) against your own diff, the PR title (`gh pr view <pr#> --json title --jq .title`), and the PR body (`gh pr view <pr#> --json body --jq .body`). The cost-conscious narrowing variant in that section (`CLAUDE.md` plus files matching `commit` / `contribut` / `style`) is acceptable here — the warm-session pass runs on every PR so the cheaper scope is fine; the orchestrator-dispatched independent reviewer always does the full depth-2 traversal so true convention violations still get caught either way. The point of this layer is to catch the easy violations before the reviewer dispatch.
+
+Push any fixes (code, title, or body) before heartbeating. Use `gh pr edit <pr#> --title "..."` and `gh pr edit <pr#> --body "..."` to update title / body without touching the diff. **Don't iterate forever** — one pass; if you spot something genuinely contentious, leave it for the review subagent.
 
 Once the diff is clean, heartbeat and stop:
 
@@ -1580,7 +1631,29 @@ These are intentionally tighter than the main dispatch template — no full pipe
 Dispatched on the `READY_FOR_REVIEW` heartbeat (Phase 5 step 5) and on the reconstruction probe's "review never ran" branch. Runs at the orchestrator's level so it always has `general-purpose` / `Task` access — that's the whole reason this dispatch lives on the orchestrator, not the implementing agent. Use `subagent_type: "general-purpose"`, **`run_in_background: true`**. Background dispatch is required, not optional: a foreground review dispatch would block the orchestrator's event loop on the first review while the next two implementing agents in a cap=3 run sit paused on their `READY_FOR_REVIEW` heartbeats. The review subagent doesn't count against the implementing-agent cap of 3 (Operating principles § "Concurrency cap: 3" — review subagent and the address-review fallback mini-agent are orchestrator-level, short-lived, and orthogonal to the cap), so dispatching it in the background is purely additive concurrency. The orchestrator routes the terminal notification's `result` field by literal prefix match — see Phase 5 step 5's `READY_FOR_REVIEW` branch for the LGTM / FINDINGS / malformed routing rules. Both LGTM and FINDINGS branches `SendMessage` the warm implementing agent rather than dispatching a fresh address-review (the address-review mini-agent below is the fallback, not the default).
 
 ```
-You are reviewing PR #<pr#> on <repo>. Fetch the diff with `gh pr diff <pr#>`. Review it against the project's conventions documented in `CLAUDE.md`, `.claude/instructions/*.md`, and `CONTRIBUTING.md`. Look for: scope creep, undocumented decisions, missing tests, dead code, unclear naming, breaking changes that aren't called out, security issues, and convention violations.
+You are reviewing PR #<pr#> on <repo>.
+
+Fetch the three PR artefacts:
+
+  gh pr diff <pr#>                              # diff
+  gh pr view <pr#> --json title --jq .title     # title
+  gh pr view <pr#> --json body  --jq .body      # body
+
+The convention check applies to all three artefacts, not just the diff. The PR title and body are where commit-message style rules live in most squash-merge workflows (the title becomes the squash subject; the body becomes the squash body), so a diff-only review will miss real convention violations on the prose side.
+
+Run the **Convention-loading protocol** (Modules 1 + 2 + 3 — see the section by that name near the top of the `workflow:implement` skill) on the diff, title, and body. The full protocol in summary:
+
+1. Check out the PR branch first (`gh pr checkout <pr#>`) so file reads source from the PR's HEAD, not from `main` — PRs that themselves modify `CLAUDE.md` must be reviewed against the conventions they propose to install.
+2. Read `CLAUDE.md` at the repo root.
+3. Identify every markdown link or path-shaped reference in `CLAUDE.md` that points to a doc-shaped file (`.md`, `.rst`, `.txt`) inside this repo. Read each.
+4. From each of those, follow one more level of doc-shaped links — depth-2 from `CLAUDE.md`. Stop there. Do **not** recurse beyond depth 2.
+5. Always also read `CONTRIBUTING.md` at the repo root if it exists, even if no link reaches it.
+6. Skip code paths, generated files, lockfiles, and external URLs.
+7. Verify the diff, title, and body against the union of rules collected. Convention violations are first-class findings — do not skip a violation because it "seems minor".
+
+Graceful degradation: if `CLAUDE.md` does not exist, has zero doc-shaped links, and no `CONTRIBUTING.md` is present, complete without error — there is just nothing to enforce beyond what you already know.
+
+Then review the diff for the standard code-quality concerns: scope creep, undocumented decisions, missing tests, dead code, unclear naming, breaking changes that aren't called out, security issues. The convention check layers on top of these — it does **not** displace them.
 
 Post each finding as an inline comment via the GitHub API:
 
@@ -1590,11 +1663,15 @@ Post each finding as an inline comment via the GitHub API:
     -f path='<file>' \
     -f line=<line>
 
-Use the `Claude Reviewer: ` prefix on every comment. If the diff is clean (no findings), post a single PR comment via `gh pr comment <pr#> --body 'Claude Reviewer: LGTM. <one-line summary of what you checked>'` and return.
+For findings on the PR title or body (which have no file/line to anchor to), post a PR-level comment instead:
+
+  gh pr comment <pr#> --body 'Claude Reviewer: <finding>'
+
+Use the `Claude Reviewer: ` prefix on every comment. If everything is clean (no findings on diff, title, or body), post a single PR comment via `gh pr comment <pr#> --body 'Claude Reviewer: LGTM. <one-line summary of what you checked>'` and return.
 
 Return EXACTLY ONE of:
-- `LGTM <pr-url>` — diff is clean; the single `Claude Reviewer: LGTM` PR comment is posted.
-- `FINDINGS <pr-url> <count>` — `<count>` inline `Claude Reviewer:` comments posted.
+- `LGTM <pr-url>` — diff, title, and body are clean; the single `Claude Reviewer: LGTM` PR comment is posted.
+- `FINDINGS <pr-url> <count>` — `<count>` `Claude Reviewer:` comments posted (inline for line-anchored findings, PR-level for title / body / unanchored findings).
 - `ERRORED <reason>` — non-recoverable.
 ```
 
@@ -1715,6 +1792,17 @@ You run in an isolated worktree (`isolation: worktree`). Check out the PR branch
 
 Pipeline:
 
+0. **Load project conventions before addressing any finding.** Run the **Convention-loading protocol** (Modules 1 + 2 — see the section by that name near the top of the `workflow:implement` skill) on the PR branch's HEAD:
+
+   - Read `CLAUDE.md` at the repo root.
+   - Identify every markdown link or path-shaped reference in `CLAUDE.md` that points to a doc-shaped file (`.md`, `.rst`, `.txt`) inside this repo. Read each.
+   - From each of those, follow one more level of doc-shaped links — depth-2 from `CLAUDE.md`. Stop there.
+   - Always also read `CONTRIBUTING.md` at the repo root if it exists.
+   - Skip code paths, generated files, lockfiles, and external URLs.
+   - Graceful degradation: if `CLAUDE.md` does not exist and no `CONTRIBUTING.md` is present, proceed without it.
+
+   This load runs **before** addressing any finding so you do not fix one convention violation by reproducing another. Many findings will themselves be convention violations (e.g. "PR body recapitulates the diff", "bullets aren't parallel-shape") and the rule the reviewer cited lives in the docs you just loaded — your fix has to comply with the same rule.
+
 1. Fetch unaddressed inline comments:
 
      gh api 'repos/{owner}/{repo}/pulls/<pr#>/comments' --paginate
@@ -1723,7 +1811,7 @@ Pipeline:
 
 2. For each unaddressed `Claude Reviewer:` comment:
 
-   a. Make the code change, OR document why the suggestion shouldn't be adopted.
+   a. Make the code change (or PR-title / PR-body edit, for findings about prose), OR document why the suggestion shouldn't be adopted. PR title / body edits use `gh pr edit <pr#> --title "..."` / `gh pr edit <pr#> --body "..."`.
    b. Commit with a conventional-commits message describing the change. One commit per finding is fine; squashing related findings into one commit is fine too — use judgment.
    c. Post a threaded reply:
 
