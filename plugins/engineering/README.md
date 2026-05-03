@@ -23,7 +23,7 @@ Several skills (`to-issues`, `to-prd`, `triage`, and indirectly `diagnose` / `td
 - An **issue tracker** (GitHub by default) and **triage label vocabulary** (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`).
 - A **domain glossary** at `CONTEXT.md` and **ADRs** under `docs/adr/`.
 
-Run `/setup` once per repo to scaffold these. The other skills will then read from `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md`, and `docs/agents/domain.md`.
+Run `engineering:setup` once per repo to scaffold these. The other skills will then read from `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md`, and `docs/agents/domain.md`.
 
 ## Attribution
 
