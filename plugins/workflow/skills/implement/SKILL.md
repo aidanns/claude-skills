@@ -1908,7 +1908,7 @@ This skill is gh-specific. To extend to another tracker (Linear, Jira, etc.) the
 | Operation | gh today |
 |---|---|
 | List by selector | `gh issue list / gh api` |
-| Read body | `gh issue view <n> --json body` |
+| Read issue thread (body + comments) | `gh issue view <n> --json body,comments` |
 | Update body | `gh issue edit <n> --body` |
 | Add/remove labels | `gh issue edit <n> --add-label / --remove-label` |
 | Comment | `gh issue comment <n>` |
