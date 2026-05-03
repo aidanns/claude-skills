@@ -25,8 +25,9 @@
 #   update-issue <id> <issue#> <new-state> [<key=value> ...]
 #       Update the per-issue terminal state and any dispatch-context fields
 #       (branch, worktree, pr_number, pr_url, agent_id, blocked_question,
-#       paused_reason, errored_reason, body_snapshot, labels_snapshot). Keys
-#       outside that allow-list are rejected so the schema stays disciplined.
+#       paused_reason, errored_reason, body_snapshot, labels_snapshot,
+#       comments_snapshot). Keys outside that allow-list are rejected so the
+#       schema stays disciplined.
 #       <new-state> must be one of: scheduled, in-progress, automerge_set,
 #       merged, blocked, paused, errored, externally_closed. (externally_closed
 #       is the terminal outcome the parked-issue poll uses when an issue is
@@ -187,7 +188,8 @@ cmd_init() {
                     paused_reason: null,
                     errored_reason: null,
                     body_snapshot: null,
-                    labels_snapshot: null
+                    labels_snapshot: null,
+                    comments_snapshot: null
                   })
                 | map({(.number | tostring): .})
                 | add // {}),
@@ -238,9 +240,9 @@ cmd_update_issue() {
     key="${kv%%=*}"
     value="${kv#*=}"
     case "$key" in
-      branch|worktree|pr_number|pr_url|agent_id|blocked_question|paused_reason|errored_reason|body_snapshot|labels_snapshot) ;;
+      branch|worktree|pr_number|pr_url|agent_id|blocked_question|paused_reason|errored_reason|body_snapshot|labels_snapshot|comments_snapshot) ;;
       *)
-        printf 'session-state: rejected key %q (allowed: branch worktree pr_number pr_url agent_id blocked_question paused_reason errored_reason body_snapshot labels_snapshot)\n' "$key" >&2
+        printf 'session-state: rejected key %q (allowed: branch worktree pr_number pr_url agent_id blocked_question paused_reason errored_reason body_snapshot labels_snapshot comments_snapshot)\n' "$key" >&2
         exit 2
         ;;
     esac

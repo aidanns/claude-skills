@@ -119,7 +119,7 @@ Two paths, mutually exclusive:
   printf 'workflow:implement session: %s\n' "$session_id"
   ```
 
-  Then run the **`SendMessage`-availability probe** (next subsection) and proceed to issue-list resolution below.
+  Then run the **session-start probes** — `SendMessage`-availability (Phase 1.0a) and repo-owner identity (Phase 1.0b) — in the next two subsections, then proceed to issue-list resolution below.
 
 #### Phase 1.0a — `SendMessage`-availability probe (fresh runs only)
 
@@ -143,6 +143,31 @@ workflow:implement session: wfi-2026-05-02-aaaa — SendMessage available: yes
 ```
 
 (or `SendMessage available: no — warm-agent path will use address-review fallback` when absent — phrase it so the user understands the run is still proceeding, just down the fallback branch).
+
+#### Phase 1.0b — Repo-owner probe (fresh runs and `--resume`)
+
+Probe once at session start, immediately after the `SendMessage`-availability probe and before issue-list resolution. Cache the result in a session-scoped variable (`repo_owner_login = "<login>"`) that Phase 2's brief-detection rule, Phase 5's dispatch-prompt construction, and the parked-issue poll's `comments_snapshot` rebuild all read.
+
+```bash
+repo_owner_login=$(gh repo view --json owner --jq .owner.login)
+```
+
+The login string identifies who the orchestrator treats as the **maintainer** for two purposes:
+
+1. **Brief detection** (Phase 2 / Phase 5). A comment is treated as the dispatched agent's spec iff its body contains a line beginning with `## Agent Brief` *and* its `author.login` equals `repo_owner_login`. If multiple briefs match, the most recent by `createdAt` wins.
+2. **Maintainer-comment filter** (Case B in the dispatch prompt — see Phase 5 step 4 § Dispatch prompt template). When no brief is present, comments are included in the dispatch prompt only if their `author.login` equals `repo_owner_login`. Bots, drive-by commenters, and prior `Claude:` / `Claude Reviewer:` comments drop out.
+
+The owner check works directly for repos owned by a user account (`gh repo view --json owner --jq .owner.login` returns the user's login, which is also the comment author's login when they comment on their own repo). For org-owned repos the rule produces "no briefs match / no maintainer comments included" — the safe fallback to body-as-spec — until a configurable allowlist is added (out of scope for #114).
+
+The probe runs the same way on `--resume` (the persisted state file does not cache the value — `gh repo view` is cheap and the source-of-truth answer might have changed if ownership transferred, which is rare but cheap to re-check).
+
+If the probe fails (no remote, `gh` not authenticated, network down), surface the error and bail; brief detection cannot run without it. There is no degradation mode — the rule is intentionally strict because the alternative (treat any commenter's `## Agent Brief` as the spec) is a trust-boundary failure.
+
+Log the probe result once, chat-visible:
+
+```text
+workflow:implement session: wfi-2026-05-02-aaaa — repo owner: aidanns
+```
 
 - **Resume (`--resume <id>`).** Load the persisted state file:
 
@@ -190,7 +215,7 @@ workflow:implement session: wfi-2026-05-02-aaaa — SendMessage available: yes
     "$session_id" 412 scheduled blocked_question=
   ```
 
-  **Ordering — selective Phase 2 runs *before* Phase 4 re-entry.** Run the selective re-Phase-2 above to completion (questions surfaced, answers applied, `blocked → scheduled` flips written) *before* the Phase 4 re-entry pass at line 121, not after. Phase 4 attaches the `scheduled` label and creates a TaskList task for every issue whose persisted state is `scheduled` or `in-progress` at the time it runs; an issue freshly flipped from `blocked → scheduled` only picks up its label and TaskList row if Phase 4 sees it as `scheduled` — i.e. after the flip. If Phase 4 ran first, newly-unblocked issues would slip straight to Phase 5 dispatch with no TaskList task tracking them.
+  **Ordering — selective Phase 2 runs *before* Phase 4 re-entry.** Run the selective re-Phase-2 above to completion (questions surfaced, answers applied, `blocked → scheduled` flips written) *before* the Phase 4 re-entry pass described earlier in the resume bullet above ("Re-enter the pipeline at Phase 4 — but only to apply labels…"), not after. Phase 4 attaches the `scheduled` label and creates a TaskList task for every issue whose persisted state is `scheduled` or `in-progress` at the time it runs; an issue freshly flipped from `blocked → scheduled` only picks up its label and TaskList row if Phase 4 sees it as `scheduled` — i.e. after the flip. If Phase 4 ran first, newly-unblocked issues would slip straight to Phase 5 dispatch with no TaskList task tracking them.
 
   Phase 5 then dispatches `#412` on its next loop tick exactly as it would for any freshly-scheduled issue. (The `Closes #N` PR will reach merge through the normal pipeline; nothing about the resumed-from-`blocked` path differs after this point.)
 
@@ -200,7 +225,7 @@ workflow:implement session: wfi-2026-05-02-aaaa — SendMessage available: yes
   workflow:implement resumed: <id> — repo=<owner/repo> selector=<...> in-flight=<n>
   ```
 
-  After the resumed-session log line, run the **`SendMessage`-availability probe** the same way Phase 1.0a does for fresh runs (see the dedicated subsection below). The result is per-orchestrator-session, not persisted in the state file, so a resumed run probes fresh — the user may have toggled `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` between the original and resumed sessions, and the probe is the only authoritative source. Cache `sendmessage_available` for the rest of the resumed session the same way.
+  After the resumed-session log line, run the **session-start probes** — `SendMessage`-availability (Phase 1.0a) and repo-owner identity (Phase 1.0b) — the same way fresh runs do. Neither result is persisted in the state file, so a resumed run probes fresh — the user may have toggled `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` between the original and resumed sessions, and ownership of the repo could have transferred (rare but cheap to re-check). Cache `sendmessage_available` and `repo_owner_login` for the rest of the resumed session.
 
 ### Phase 1.1 — Resolve the issue list
 
@@ -208,18 +233,20 @@ Resolve the issue list (fresh runs only — `--resume` skips this):
 
 ```bash
 # Explicit numbers — fetch each.
-gh issue view <n> --json number,title,body,labels,milestone,state,assignees
+gh issue view <n> --json number,title,body,labels,milestone,state,assignees,comments
 
 # Label-based:
-gh issue list --state open --label <name> --json number,title,body,labels,milestone
+gh issue list --state open --label <name> --json number,title,body,labels,milestone,comments
 
 # Milestone-based:
-gh issue list --state open --milestone "<title>" --json number,title,body,labels,milestone
+gh issue list --state open --milestone "<title>" --json number,title,body,labels,milestone,comments
 
 # Parent / sub-issue:
 gh api "repos/:owner/:repo/issues/<n>/sub_issues" --jq '.[].number'
-# then fetch each sub-issue body
+# then fetch each sub-issue body + comments
 ```
+
+The `comments` field is included in every fetch so the brief-detection rule (Phase 2) and the dispatch prompt's Spec/Context partition (Phase 5 step 4) have the comment thread available without a second round-trip. Each comment object carries `author.login`, `createdAt`, and `body` — the three fields downstream consumers need.
 
 Exclude any issue that is closed, has the `released` label, or is currently labelled `in-progress` by a different active session (check the comment trail to disambiguate). Surface a one-line note for each excluded issue.
 
@@ -320,7 +347,7 @@ Wait for the user's answer. The orchestrator routes the answer:
 
 If the invocation carried `--force`, skip the full bail prompt — but **still surface a one-line force-confirm** when an overlapping issue carries a Phase 2 clarification recorded by the peer session. AC #3 of #104 is explicit that the orchestrator should not silently proceed when the peer has clarifications baked into an overlapping issue body, *even if the user passed `--force`* — the user is presumed to have forgotten the peer session was running, and the architecturally-divergent merge described in the issue is precisely the failure mode this case prevents.
 
-Detection. For each peer session in the `overlap` array, read its `body_snapshot` field (per-issue, populated at the BLOCKED transition — see § Session state § Per-issue dispatch-context fields) for each overlapping issue. If the field is non-null on any overlapping issue, that peer has a Phase 2 clarification recorded for the issue. (`body_snapshot` is the orchestrator's most reliable signal that "this issue's body was changed by Phase 2 / a `Claude: Blocked — <q>` answer cycle"; it's the same field the parked-issue poll uses to detect out-of-band edits.) For peer sessions without a populated `body_snapshot`, the implementing agent is mid-flight and the user clarified at intake — the issue body was edited then, and the peer's `created_at` is the lower bound; cross-check `gh issue view <n> --json body,updatedAt` against that timestamp as a fallback.
+Detection. For each peer session in the `overlap` array, read its `body_snapshot` and `comments_snapshot` fields (per-issue, populated at the BLOCKED transition — see § Session state § Per-issue dispatch-context fields) for each overlapping issue. If **either** field is non-null on any overlapping issue, that peer has a Phase 2 clarification recorded for the issue. (`body_snapshot` and `comments_snapshot` are the orchestrator's most reliable signal that "this issue's body or its dispatch-relevant comment thread was changed by Phase 2 / a `Claude: Blocked — <q>` answer cycle / a maintainer-authored brief or scope-adding comment"; they're the same fields the parked-issue poll uses to detect out-of-band edits.) For peer sessions without populated snapshots, the implementing agent is mid-flight and the user clarified at intake — the issue body was edited then, and the peer's `created_at` is the lower bound; cross-check `gh issue view <n> --json body,updatedAt` against that timestamp as a fallback.
 
 Force-confirm prompt:
 
@@ -429,7 +456,8 @@ Per-user (not per-project) so a user with multiple repo checkouts under `~/Proje
       "paused_reason": null,
       "errored_reason": null,
       "body_snapshot": null,
-      "labels_snapshot": null
+      "labels_snapshot": null,
+      "comments_snapshot": null
     },
     "282": {"number": 282, "state": "in-progress", "branch": "aidanns/bar", "worktree": "...", "worktrees": ["..."], "pr_number": null, "pr_url": null, "agent_id": "agent-a98681219485b754d", "...": null},
     "283": {"number": 283, "state": "scheduled", "worktrees": [], "...": null}
@@ -446,12 +474,12 @@ Per-issue `state` field — terminal token from the orchestrator's perspective:
 - `in-progress` — agent dispatched (Phase 5 step 4), PR may or may not be open yet.
 - `automerge_set` — orchestrator set automerge after review completed (Phase 5 step 5). Phase 5b's shell monitor is now driving the PR to merge.
 - `merged` — Phase 5b shell monitor emitted `MERGED`; Phase 6 housekeeping is done or in progress.
-- `blocked` — agent returned `BLOCKED <question>` (Phase 7). `blocked_question` carries the parked question. The `body_snapshot` and `labels_snapshot` fields are populated at this transition (used by the parked-issue poll — see § Progress reporting § Parked-issue poll).
+- `blocked` — agent returned `BLOCKED <question>` (Phase 7). `blocked_question` carries the parked question. The `body_snapshot`, `labels_snapshot`, and `comments_snapshot` fields are populated at this transition (used by the parked-issue poll — see § Progress reporting § Parked-issue poll).
 - `paused` — agent returned `PAUSED <reason>` (Phase 5 step 5 PAUSED branch). `paused_reason` carries the pause cause.
 - `errored` — agent returned `ERRORED <error>`. `errored_reason` carries the error string.
 - `externally_closed` — the parked-issue poll observed `state == CLOSED` on GitHub (issue closed externally — duplicate, no-repro, etc.) while the issue was `blocked`. Terminal; treated as fully-resolved for Phase 8 garbage collection (the issue is gone — re-dispatch would produce orphan work).
 
-Per-issue dispatch-context fields (`branch`, `worktree`, `pr_number`, `pr_url`, `agent_id`, `blocked_question`, `paused_reason`, `errored_reason`, `body_snapshot`, `labels_snapshot`) are written by `update-issue` as state advances. `agent_id` is the harness-assigned ID of the warm implementing agent — populated when the agent is dispatched (Phase 5 step 4) and cleared when the agent terminates (`READY_TO_MERGE`, `BLOCKED`, `PAUSED`, `ERRORED`). The malformed-terminal recovery probe (Phase 5 step 5) uses this field to decide whether to `SendMessage` the warm agent or fall back to dispatching the address-review mini-agent fresh.
+Per-issue dispatch-context fields (`branch`, `worktree`, `pr_number`, `pr_url`, `agent_id`, `blocked_question`, `paused_reason`, `errored_reason`, `body_snapshot`, `labels_snapshot`, `comments_snapshot`) are written by `update-issue` as state advances. The `comments_snapshot` field captures the canonical-string representation of the comments that *would be included in the next dispatch* under the brief-detection rule (see Phase 2): the brief comment body in Case A, or the chronological concatenation of maintainer-authored comment bodies (separated by `\n---comments-snapshot-separator---\n`) in Case B. Case-flips between ticks (brief deleted, brief newly added, maintainer added/edited a comment) produce a different canonical string, which the parked-issue poll uses to detect out-of-band changes the same way it uses `body_snapshot`. `agent_id` is the harness-assigned ID of the warm implementing agent — populated when the agent is dispatched (Phase 5 step 4) and cleared when the agent terminates (`READY_TO_MERGE`, `BLOCKED`, `PAUSED`, `ERRORED`). The malformed-terminal recovery probe (Phase 5 step 5) uses this field to decide whether to `SendMessage` the warm agent or fall back to dispatching the address-review mini-agent fresh.
 
 The `worktrees` array is the lifecycle-spanning record of every worktree the orchestrator spawned for the PR — implementing agent (Phase 5 step 4) plus any conflict-resolution / CI-failure-fix / review-comment / address-review fallback mini-agents dispatched later (Phase 5b). It is appended-to via the dedicated `add-worktree` subcommand (idempotent, see § Helper script) so no spawned worktree is missed even if the orchestrator dispatches multiple mini-agents over the PR's lifetime. Phase 6 housekeeping iterates this array to clean up — without it the mini-agent worktrees leak on disk because the orchestrator only ever recorded the implementing agent's path. The singular `worktree` field is retained alongside as diagnostic information ("which path was the implementing agent's"); it is not the source of truth for cleanup.
 
@@ -472,7 +500,7 @@ Subcommands:
 | `init <id> <repo> <selector-json> <issues-json> [<deps-json>]` | Phase 3 → create the state file from the resolved issue list. Per-issue state defaults to `scheduled` and dispatch-context fields default to `null`. |
 | `get <id>` | Phase 1 (`--resume`) → print the state file, or exit 1 if missing. |
 | `path <id>` | Print the absolute path (whether or not the file exists). |
-| `update-issue <id> <issue#> <new-state> [<key=value> ...]` | Phase 5 / Phase 6 → flip per-issue state and patch dispatch-context fields. Allow-listed keys: `branch`, `worktree`, `pr_number`, `pr_url`, `agent_id`, `blocked_question`, `paused_reason`, `errored_reason`, `body_snapshot`, `labels_snapshot`. Allow-listed `<new-state>` values: `scheduled`, `in-progress`, `automerge_set`, `merged`, `blocked`, `paused`, `errored`, `externally_closed`. |
+| `update-issue <id> <issue#> <new-state> [<key=value> ...]` | Phase 5 / Phase 6 → flip per-issue state and patch dispatch-context fields. Allow-listed keys: `branch`, `worktree`, `pr_number`, `pr_url`, `agent_id`, `blocked_question`, `paused_reason`, `errored_reason`, `body_snapshot`, `labels_snapshot`, `comments_snapshot`. Allow-listed `<new-state>` values: `scheduled`, `in-progress`, `automerge_set`, `merged`, `blocked`, `paused`, `errored`, `externally_closed`. |
 | `add-worktree <id> <issue#> <path>` | Phase 5 / Phase 5b → append `<path>` to `issues[<issue#>].worktrees`. Idempotent — re-adding a path the array already contains is a no-op. The orchestrator calls this immediately after parsing each `isolation: worktree`-dispatched agent's terminal notification, so Phase 6 housekeeping can iterate every worktree spawned during the PR's lifecycle. |
 | `append-digest <id> <line>` | Phase 5 progress reporting → append a digest line to `digest_tail` (capped at 50 entries). |
 | `list` | `--session list` → enumerate every state file with ID, repo, last-modified timestamp, selector summary, in-flight count. |
@@ -518,11 +546,33 @@ A resumed session re-enters Phase 5 with rehydrated orchestrator state; Phase 5 
 
 ## Phase 2 — Pre-flight clarification
 
-Read each issue body in full. Identify *only* gaps that would cause a publicly-observable break if guessed wrong:
+Read each issue's full thread — body **and** comments — in full. The body is the user's original framing; comments may carry the authoritative spec (an agent brief from `engineering:triage`), maintainer clarifications added in-thread, decisions captured during grilling, and prior `Claude: Blocked` Q&A history. All of these can resolve clarifications that the body alone leaves open.
+
+### Brief detection
+
+A comment is treated as the dispatched agent's **spec** iff:
+
+1. Its body contains a line beginning with `## Agent Brief` (regex `(?m)^## Agent Brief\b` — preceding lines such as the triage skill's mandated disclaimer do not disqualify it), AND
+2. Its `author.login` equals `repo_owner_login` (the cached value from Phase 1.0b).
+
+If multiple comments match, the most recent by `createdAt` wins. If no comment matches, no brief exists for this issue.
+
+The detected brief (if any) is the load-bearing classification that flows downstream:
+
+- **Case A — Brief present.** The brief is the spec. Phase 5 step 4's dispatch prompt frames the brief comment body as **Spec**, with the issue body appended below as **Context: original issue body**. No other comments are included in the dispatch prompt.
+- **Case B — No brief.** The body is the spec. Phase 5 step 4's dispatch prompt frames the body as **Spec**, with all maintainer-authored comments (`author.login == repo_owner_login`) appended below as **Context: maintainer comments** in chronological order. Comments by anyone else (bots, drive-by commenters, prior `Claude:` / `Claude Reviewer:` activity) are excluded.
+
+The Case-A/Case-B classification is computed once here and reused by Phase 5 step 4 (dispatch-prompt construction), Phase 5 step 5 (BLOCKED transition's `comments_snapshot` write), and the parked-issue poll (`comments_snapshot` rebuild). All three derive the canonical-string representation of "the comments that would be included in the next dispatch" from the same rule.
+
+### Clarification scan
+
+Identify *only* gaps that would cause a publicly-observable break if guessed wrong:
 
 - Undecided naming for files, APIs, schemas, env vars, labels.
 - Required context marked `TBD`, `?`, "decide in this issue", or similar placeholders.
 - Open questions explicitly listed in the issue body's "Decisions to make" sections.
+
+In Case A, the brief is the contract — only scan the brief for unresolved gaps. The body and other comments are background context, not requirements; the triage flow is responsible for surfacing brief-level gaps before the issue lands at `ready-for-agent`. In Case B, scan the body and any maintainer-authored comment that adds scope.
 
 Internal implementation choices (test layout within a package, helper function names, internal refactor decisions) are NOT clarification triggers — the dispatched agent resolves those itself.
 
@@ -530,12 +580,12 @@ If clarifications exist:
 
 1. Compile into ONE batched message: numbered, grouped by issue.
 2. Surface to user. Wait for answers.
-3. After answers, update each affected issue body via `gh issue edit <n> --body "<updated>"` so the dispatched agent has full context without needing this orchestrator's conversation history.
+3. After answers, update each affected issue body via `gh issue edit <n> --body "<updated>"` so the dispatched agent has full context without needing this orchestrator's conversation history. (In Case A, also re-scan the comment thread on the next tick — if the user clarified by editing the brief comment directly, the brief-detection rule will pick that up automatically the next time the issue is read.)
 4. Proceed.
 
 If no clarifications: continue silently.
 
-On `--resume`, this same flow runs **selectively** — only for issues whose persisted state is `blocked` (they parked on a question the prior conversation held in chat, never persisted to the issue body). All other resumed issues skip Phase 2 and use the cached body. See Phase 1.0's `--resume` branch for the selective-re-run mechanics and worked example.
+On `--resume`, this same flow runs **selectively** — only for issues whose persisted state is `blocked` (they parked on a question the prior conversation held in chat, never persisted to the issue body). All other resumed issues skip Phase 2 and use the cached body. See Phase 1.0's `--resume` branch for the selective-re-run mechanics and worked example. The resumed-`blocked` selective re-run preserves its existing narrowly-scoped comment-fetch (the latest `Claude: Blocked — <question>` lookup in Phase 1.0's resumed-`blocked` flow) — that flow is orthogonal to the brief-detection rule above and stays unchanged.
 
 ## Phase 3 — Dependency analysis
 
@@ -645,9 +695,9 @@ Loop until every issue is terminal (merged, parked, or excluded):
 
 3a. **Pre-dispatch stale-path scan** — applies *only* to issues whose declared deps merged after Phase 1 intake (i.e. mid-run). Skip otherwise.
 
-   When a dep PR rearranges code (renames a package, collapses one module into another), file paths quoted in the dependent issue's body — `packages/foo/src/foo/bar.py:78–91`, `src/auth/login.ts`, etc. — go stale. The dispatched agent reads the issue body verbatim, so a stale path either burns tokens hunting for files that no longer exist or, worse, leads the agent to recreate the moved structures rather than editing the new ones.
+   When a dep PR rearranges code (renames a package, collapses one module into another), file paths quoted in the spec / context that will be rendered into the dispatch prompt — `packages/foo/src/foo/bar.py:78–91`, `src/auth/login.ts`, etc. — go stale. The dispatched agent reads the spec / context verbatim, so a stale path either burns tokens hunting for files that no longer exist or, worse, leads the agent to recreate the moved structures rather than editing the new ones. (Per `engineering:triage`'s `AGENT-BRIEF.md`, briefs avoid file paths by convention — so under Case A the brief itself is path-free in well-triaged issues, but the issue body included as Context may still quote paths, and Case B's body and maintainer comments routinely do.)
 
-   Scan the issue body before building the dispatch prompt:
+   Scan the same content the dispatch prompt will embed (per Phase 2's brief-detection rule):
 
    1. Extract candidate paths via `grep -oE`. Cover three shapes: `packages/...`, `src/...`, and bare repo-root files (e.g. `Cargo.toml`, `pyproject.toml`). Line-number suffixes `:NN` or `:NN-NN` (or em-dash `:NN–NN`) are common in this repo and must be stripped before the existence check.
    2. For each candidate, check existence in the *post-merge* tree with `git ls-tree HEAD <path>` (or `test -e <path>` if a worktree is already checked out at the repo root).
@@ -657,10 +707,14 @@ Loop until every issue is terminal (merged, parked, or excluded):
    Worked example — issue #332 quotes `packages/gpg-backend-cli-host/src/gpg_backend_cli_host/gpg.py:78–91` and dep #316 collapsed that package into `gpg-bridge`:
 
    ```bash
-   body=$(gh issue view <n> --json body --jq .body)
+   # Fetch the same content the dispatch prompt will embed.
+   # Case A (brief present): scan the brief comment body + the issue body.
+   # Case B (no brief): scan the issue body + concatenated maintainer comment bodies.
+   # The Phase 2 brief-detection result determines which content set to scan.
+   content=$(printf '%s\n' "$dispatch_spec_block" "$dispatch_context_block")
 
    # 1. Extract candidate paths. Strip optional :NN[-NN] / :NN–NN suffix in a second pass.
-   paths=$(printf '%s\n' "$body" \
+   paths=$(printf '%s\n' "$content" \
      | grep -oE '(packages/[A-Za-z0-9_./-]+|src/[A-Za-z0-9_./-]+|\b[A-Za-z0-9_-]+\.(toml|yaml|yml|json|md|lock))(:[0-9]+(-[0-9]+|–[0-9]+)?)?' \
      | sed -E 's/:[0-9]+(-[0-9]+|–[0-9]+)?$//' \
      | sort -u)
@@ -676,12 +730,20 @@ Loop until every issue is terminal (merged, parked, or excluded):
 
    # 3. If stale paths found, render the preamble for the dispatch prompt.
    if (( ${#stale[@]} > 0 )); then
-     printf 'Stale paths (deps merged mid-run): the following paths in the issue body no longer exist in HEAD — locate the new home before editing:\n'
+     printf 'Stale paths (deps merged mid-run): the following paths in the spec / context no longer exist in HEAD — locate the new home before editing:\n'
      printf -- '- %s\n' "${stale[@]}"
    fi
    ```
 
    Inject the preamble's stdout into the dispatch prompt (see the dispatch template below). If the array is empty, omit the section — exactly the same convention the Phase 1 auto-memory sweep uses.
+
+3b. **Comments-bloat warning** — applies *only* in Case B (no brief detected per Phase 2). If the canonical comments string that will be embedded as **Context: maintainer comments** in the dispatch prompt exceeds 20 KB (`20480` bytes), emit a one-line non-blocking warning naming the issue number and byte count:
+
+    ```text
+    workflow:implement: #<n> has <K> KB of maintainer comments included in dispatch — consider triaging to a written brief to bound future dispatches
+    ```
+
+    The warning surfaces to the user once per dispatch (not per tick) and does **not** block the dispatch — the agent gets the full content regardless. The threshold is preemptive: this repo's typical issue carries zero or one comments today, so the warning fires only on issues whose discussion has outgrown the body-as-spec model. The escape hatch is for the maintainer to triage to a written brief, which moves the issue to Case A and bounds the dispatch payload by construction (Case A excludes non-brief comments). Truncation / summarization were considered and rejected during the design grilling — the cost of a wrong scope from silent truncation dwarfs the cost of a verbose dispatch prompt. Skip the warning entirely under Case A; the brief is the spec and the comment thread is excluded.
 
 4. **Dispatch agent** with `isolation: worktree`, `run_in_background: true`. Use the **dispatch prompt template** below. This is its own tool-call group — do not parallelise the `Agent` call with the `TaskUpdate` from step 2 or the `gh issue edit` from step 3.
 
@@ -708,7 +770,7 @@ Loop until every issue is terminal (merged, parked, or excluded):
    - On the implementing agent's `READY_TO_MERGE` terminal: `update-issue <id> <n> in-progress agent_id=` (the warm agent has terminated; clear `agent_id` so the malformed-terminal probe doesn't try to `SendMessage` a gone agent on a future tick). The orchestrator then runs the merge handoff — see automerge-gate below.
    - On automerge set (the orchestrator runs the merge handoff after the warm agent's `READY_TO_MERGE` return): `update-issue <id> <n> automerge_set`.
    - On the Phase 5b shell monitor's `MERGED` event: `update-issue <id> <n> merged` (Phase 6 housekeeping then runs).
-   - On `BLOCKED`: `update-issue <id> <n> blocked blocked_question="<question>" agent_id= body_snapshot="<issue body>" labels_snapshot="<comma-joined sorted labels>"`. Clear `agent_id` (the agent terminated). The `body_snapshot` / `labels_snapshot` fields seed the parked-issue poll (see § Progress reporting § Parked-issue poll § Snapshot persistence) so the first post-park tick has something to compare against — and so a `/clear` + `--resume <id>` reattachment doesn't lose the comparison baseline.
+   - On `BLOCKED`: `update-issue <id> <n> blocked blocked_question="<question>" agent_id= body_snapshot="<issue body>" labels_snapshot="<comma-joined sorted labels>" comments_snapshot="<canonical comments string>"`. Clear `agent_id` (the agent terminated). The `body_snapshot`, `labels_snapshot`, and `comments_snapshot` fields seed the parked-issue poll (see § Progress reporting § Parked-issue poll § Snapshot persistence) so the first post-park tick has something to compare against — and so a `/clear` + `--resume <id>` reattachment doesn't lose the comparison baseline. The canonical comments string is computed via Phase 2's brief-detection rule against the freshly-fetched comment list: in Case A, just the brief comment body; in Case B, the chronological concatenation of maintainer-authored comment bodies separated by `\n---comments-snapshot-separator---\n` (or the empty string if no qualifying comments exist).
    - On `PAUSED`: `update-issue <id> <n> paused paused_reason="<reason>" agent_id=`. Clear `agent_id` (the agent terminated).
    - On `ERRORED`: `update-issue <id> <n> errored errored_reason="<error>" agent_id=`. Clear `agent_id` (the agent terminated).
    - On `externally_closed` (parked-issue poll observed `state == CLOSED`): `update-issue <id> <n> externally_closed`. No further state-file fields are required — the existing `blocked_question` survives in the file as the audit trail of what the issue had been parked on before it was closed externally; `agent_id` was already cleared when the issue parked on `BLOCKED`.
@@ -828,10 +890,10 @@ When the all-parked row matches and the user has not opted out of polling, the 3
 What it queries — for each issue in `state == "blocked"`:
 
 ```bash
-gh issue view <N> --json state,body,labels
+gh issue view <N> --json state,body,labels,comments
 ```
 
-**Snapshot persistence.** The poll's change-detection compares against `body_snapshot` and `labels_snapshot` fields persisted on the per-issue record in the session state file (allow-listed in `update-issue`). The snapshot is captured at the BLOCKED transition (Phase 5 step 5's BLOCKED branch — alongside the `blocked_question` write) and refreshed on every poll tick after the comparison. This makes the poll durable across `/clear` + `--resume <id>`: a resumed session reads the snapshot back from the state file and the next poll tick compares against it instead of either firing spuriously (snapshot empty ⇒ first-poll fallback) or skipping comparison entirely.
+**Snapshot persistence.** The poll's change-detection compares against `body_snapshot`, `labels_snapshot`, and `comments_snapshot` fields persisted on the per-issue record in the session state file (allow-listed in `update-issue`). All three are captured at the BLOCKED transition (Phase 5 step 5's BLOCKED branch — alongside the `blocked_question` write) and refreshed on every poll tick after the comparison. This makes the poll durable across `/clear` + `--resume <id>`: a resumed session reads the snapshots back from the state file and the next poll tick compares against them instead of either firing spuriously (snapshot empty ⇒ first-poll fallback) or skipping comparison entirely.
 
 Concretely, the BLOCKED-branch state-file write extends to:
 
@@ -840,20 +902,22 @@ bash "$CLAUDE_PLUGIN_ROOT/skills/implement/scripts/session-state.sh" update-issu
   "$session_id" <n> blocked \
   blocked_question="<question>" \
   body_snapshot="<issue body at park time>" \
-  labels_snapshot="<comma-joined label names at park time>"
+  labels_snapshot="<comma-joined label names at park time>" \
+  comments_snapshot="<canonical comments string at park time>"
 ```
 
-`labels_snapshot` is stored as a single string (comma-joined sorted label names) rather than a JSON array to keep the allow-list value type uniform; the comparison splits and re-sorts before diffing. `body_snapshot` is the raw issue body at park time. Both are refreshed in the same `update-issue` call after each poll-tick comparison (regardless of whether a change was detected), so a quiescent issue keeps producing "no change" without re-firing on prior diffs and a noisy issue's snapshot stays current.
+`labels_snapshot` is stored as a single string (comma-joined sorted label names) rather than a JSON array to keep the allow-list value type uniform; the comparison splits and re-sorts before diffing — labels are an unordered set, sort-then-compare gives a stable canonical form. `body_snapshot` is the raw issue body at park time. `comments_snapshot` is the canonical-string representation of "the comments that would be included in the next dispatch" under Phase 2's brief-detection rule — the brief comment body in Case A, or the chronological concatenation of maintainer-authored comment bodies (separated by `\n---comments-snapshot-separator---\n`) in Case B. Comments are *ordered* (chronology is load-bearing — "scope added since park" matters), so the canonical form is order-preserving rather than sorted. The separator string is deliberately verbose to avoid collision with comment content (a maintainer's plain `---` markdown horizontal rule shouldn't trip the snapshot diff); the dispatch prompt's Context block uses a shorter `\n---\n` for human readability and accepts the (negligible) collision risk because the dispatch prompt is one-shot rather than repeatedly diffed. All three snapshots are refreshed in the same `update-issue` call after each poll-tick comparison (regardless of whether a change was detected), so a quiescent issue keeps producing "no change" without re-firing on prior diffs and a noisy issue's snapshot stays current.
 
 What counts as "changed" (any one of the following, compared against the snapshot):
 
 - **Label removed** — the `blocked` label (or any label the user said they would flip to unblock) is no longer present. The user effectively answered the parked question by removing the gate.
 - **Body updated** — the issue body differs from `body_snapshot`. The user or another tool answered the parked question by editing the body in place (the most common pattern when `/refine-issues` records a clarification).
+- **Comments changed** — the freshly-rebuilt canonical comments string differs from `comments_snapshot`. This catches three sub-cases: (a) a brand-new `## Agent Brief` comment was posted (Case-flip from B → A), (b) the existing brief was edited or a newer brief replaced it, (c) under Case B, the maintainer added or edited a comment that adds scope. Case-flips B → A and A → B both produce a different canonical string (the rule's output shape changes), so the comparison fires automatically without per-case branching.
 - **State == CLOSED** — the issue was closed externally (e.g. as a duplicate or no-repro). The clarification will never come; the run should not sit parked forever.
 
 Action on change:
 
-- **Label removed or body updated** → re-enter Phase 5 with the affected issue: clear the `blocked` label if still present, flip per-issue state from `blocked` back to `scheduled` and clear `blocked_question` on the same call (`update-issue <id> <n> scheduled blocked_question=`) so progress digests / `--session list` don't keep surfacing an already-answered question. The `body_snapshot` / `labels_snapshot` fields stay in the file but are ignored once `state != "blocked"` (the next BLOCKED transition, if any, will overwrite them). Then let the next tick pick the issue up via the normal Phase 5 dispatch path. Surface a chat line summarising what changed ("`#<N>: blocked label removed externally — resuming`" / "`#<N>: body edited externally — resuming`").
+- **Label removed, body updated, or comments changed** → re-enter Phase 5 with the affected issue: clear the `blocked` label if still present, flip per-issue state from `blocked` back to `scheduled` and clear `blocked_question` on the same call (`update-issue <id> <n> scheduled blocked_question=`) so progress digests / `--session list` don't keep surfacing an already-answered question. The `body_snapshot` / `labels_snapshot` / `comments_snapshot` fields stay in the file but are ignored once `state != "blocked"` (the next BLOCKED transition, if any, will overwrite them). Then let the next tick pick the issue up via the normal Phase 5 dispatch path. Surface a chat line summarising what changed ("`#<N>: blocked label removed externally — resuming`" / "`#<N>: body edited externally — resuming`" / "`#<N>: comment thread changed externally — resuming`").
 - **State == CLOSED** → flip per-issue state from `blocked` to the terminal `externally_closed` outcome (`update-issue <id> <n> externally_closed`), drop it from the in-flight set, and surface to the user (`#<N>: closed externally — not re-dispatched`). Do **not** open a PR or re-dispatch — the issue is gone, and re-entering Phase 5 against a closed issue would either fail or produce orphan work. `externally_closed` qualifies for Phase 8 garbage collection alongside `merged`/`errored` (see § Garbage collection).
 
 **Steady-state ticks are silent.** The digest-emission rule above (line 540) gates digests on `at least one issue is in-flight (in-progress or automerge_set)`, so the all-parked row by definition emits no digest on tick. Likewise the parked-issue poll only emits a chat line on a *change* (the three "Action on change" branches above) — a no-change tick is silent. This is intentional: an hourly heartbeat with nothing to report would be noise. Do not add a "no change" digest line to this branch; the next signal the user sees is either a real change event or the run completing.
@@ -956,11 +1020,46 @@ When in doubt, suppress. The user can always `gh pr view <pr#>` if they want raw
 The orchestrator constructs the per-agent prompt by filling in the placeholders below. The full text — not a reference — goes into the Agent call so the dispatched agent has everything it needs without consulting this skill.
 
 ```
-You are implementing GitHub issue #<N> end-to-end. Session: <session-id>. The issue body follows verbatim:
+You are implementing GitHub issue #<N> end-to-end. Session: <session-id>.
+
+<orchestrator branches on Phase 2's brief-detection rule (see Phase 2 § Brief detection):
+
+CASE A — Brief present (a maintainer-authored `## Agent Brief` comment exists):
+
+## Spec
+
+The maintainer (`<repo_owner_login>`) posted the following agent brief on the issue. Treat it as the authoritative specification — the original issue body and other discussion are background context, the brief is the contract.
 
 ---
-<full body refreshed via `gh issue view <N> --json body --jq .body`>
+<full body of the most recent matching brief comment, refreshed via `gh issue view <N> --json comments`>
 ---
+
+## Context: original issue body
+
+For background. The brief above is the authoritative spec; this is the original framing the brief was written against.
+
+---
+<full issue body refreshed via `gh issue view <N> --json body --jq .body`>
+---
+
+CASE B — No brief, with at least one maintainer-authored comment:
+
+## Spec
+
+---
+<full issue body refreshed via `gh issue view <N> --json body --jq .body`>
+---
+
+## Context: maintainer comments
+
+Maintainer (`<repo_owner_login>`) added the following comments on the issue. Treat as supporting scope to the spec above.
+
+---
+<concatenation of maintainer-authored comment bodies in chronological order, separated by `\n---\n`>
+---
+
+CASE B — No brief, no qualifying comments: render only the Spec block above (no Context section).
+>
 
 Project context: this repo's conventions are described in `CLAUDE.md` (root), `.claude/instructions/*.md` (if present), and `CONTRIBUTING.md`. Read these before editing — they define language, tooling, commit-message scopes, and any project-specific rules.
 
@@ -969,8 +1068,8 @@ Project context: this repo's conventions are described in `CLAUDE.md` (root), `.
 <if any deps merged: Dependency context — these issues already merged and may have introduced helpers / types / files you should reuse:
 - #<dep>: <PR title>. Summary: <one-line summary of what merged>.>
 
-<if the Phase 5 step 3a stale-path scan found stale paths in the issue body (only when deps merged mid-run):
-Stale paths (deps merged mid-run): the following paths quoted in the issue body above no longer exist in HEAD — locate the new home before editing instead of recreating the moved structures:
+<if the Phase 5 step 3a stale-path scan found stale paths in the spec / context above (only when deps merged mid-run):
+Stale paths (deps merged mid-run): the following paths quoted in the spec / context above no longer exist in HEAD — locate the new home before editing instead of recreating the moved structures:
 - <path 1>
 - <path 2>
 The dep PR(s) listed under Dependency context above rearranged the relevant code; check those PR diffs for the new layout.>

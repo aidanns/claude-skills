@@ -435,6 +435,48 @@ rc=$?
 set -e
 assert_exit_code "find-stale exits 2 on non-object gh-state" 2 "$rc"
 
+# --- Test 28: init seeds comments_snapshot: null per issue. ----------
+# #114 added comments_snapshot alongside body_snapshot / labels_snapshot
+# so the parked-issue poll can detect comment-thread changes the same
+# way it detects body / label changes today. The init template must
+# seed null so the first BLOCKED transition has a baseline to compare.
+sandbox=$(with_sandbox); cleanup_dirs+=("$sandbox")
+export WORKFLOW_IMPLEMENT_STATE_DIR="$sandbox"
+run_init wfi-test-28 acme/repo '[281]'
+state=$(bash "$script" get wfi-test-28)
+assert_eq "init seeds comments_snapshot:null per issue" \
+  "null" "$(printf '%s' "$state" | jq -c '.issues["281"].comments_snapshot')"
+
+# --- Test 29: update-issue accepts comments_snapshot, value round-trips. ---
+sandbox=$(with_sandbox); cleanup_dirs+=("$sandbox")
+export WORKFLOW_IMPLEMENT_STATE_DIR="$sandbox"
+run_init wfi-test-29 acme/repo '[281]'
+bash "$script" update-issue wfi-test-29 281 blocked \
+  blocked_question="what about X?" \
+  body_snapshot="issue body" \
+  labels_snapshot="bug,needs-triage" \
+  comments_snapshot="comment one
+---comments-snapshot-separator---
+comment two"
+state=$(bash "$script" get wfi-test-29)
+assert_eq "update-issue accepts comments_snapshot and round-trips it" \
+  '"comment one\n---comments-snapshot-separator---\ncomment two"' \
+  "$(printf '%s' "$state" | jq -c '.issues["281"].comments_snapshot')"
+
+# --- Test 30: update-issue clears comments_snapshot when value is empty. --
+# Mirrors the existing convention for body_snapshot / labels_snapshot:
+# empty value writes null, not the empty string.
+sandbox=$(with_sandbox); cleanup_dirs+=("$sandbox")
+export WORKFLOW_IMPLEMENT_STATE_DIR="$sandbox"
+run_init wfi-test-30 acme/repo '[281]'
+bash "$script" update-issue wfi-test-30 281 blocked \
+  comments_snapshot="something"
+bash "$script" update-issue wfi-test-30 281 blocked \
+  comments_snapshot=
+state=$(bash "$script" get wfi-test-30)
+assert_eq "empty comments_snapshot value clears the field to null" \
+  "null" "$(printf '%s' "$state" | jq -c '.issues["281"].comments_snapshot')"
+
 if (( failed != 0 )); then
   printf '\nFAIL: one or more assertions failed.\n' >&2
   exit 1
