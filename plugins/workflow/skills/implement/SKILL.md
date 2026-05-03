@@ -1641,17 +1641,7 @@ Fetch the three PR artefacts:
 
 The convention check applies to all three artefacts, not just the diff. The PR title and body are where commit-message style rules live in most squash-merge workflows (the title becomes the squash subject; the body becomes the squash body), so a diff-only review will miss real convention violations on the prose side.
 
-Run the **Convention-loading protocol** (Modules 1 + 2 + 3 — see the section by that name near the top of the `workflow:implement` skill) on the diff, title, and body. The full protocol in summary:
-
-1. Check out the PR branch first (`gh pr checkout <pr#>`) so file reads source from the PR's HEAD, not from `main` — PRs that themselves modify `CLAUDE.md` must be reviewed against the conventions they propose to install.
-2. Read `CLAUDE.md` at the repo root.
-3. Identify every markdown link or path-shaped reference in `CLAUDE.md` that points to a doc-shaped file (`.md`, `.rst`, `.txt`) inside this repo. Read each.
-4. From each of those, follow one more level of doc-shaped links — depth-2 from `CLAUDE.md`. Stop there. Do **not** recurse beyond depth 2.
-5. Always also read `CONTRIBUTING.md` at the repo root if it exists, even if no link reaches it.
-6. Skip code paths, generated files, lockfiles, and external URLs.
-7. Verify the diff, title, and body against the union of rules collected. Convention violations are first-class findings — do not skip a violation because it "seems minor".
-
-Graceful degradation: if `CLAUDE.md` does not exist, has zero doc-shaped links, and no `CONTRIBUTING.md` is present, complete without error — there is just nothing to enforce beyond what you already know.
+Run the **Convention-loading protocol** (see § Convention-loading protocol near the top of the `workflow:implement` skill — Modules 1 + 2 + 3) on the diff, title, and body. Check out the PR branch first (`gh pr checkout <pr#>`) so file reads source from the PR's HEAD, not from `main` — PRs that themselves modify `CLAUDE.md` must be reviewed against the conventions they propose to install. The canonical section is the source of truth for the load contract, depth bound, fallback rules, and graceful-degradation behaviour; do not duplicate the steps here.
 
 Then review the diff for the standard code-quality concerns: scope creep, undocumented decisions, missing tests, dead code, unclear naming, breaking changes that aren't called out, security issues. The convention check layers on top of these — it does **not** displace them.
 
@@ -1792,16 +1782,7 @@ You run in an isolated worktree (`isolation: worktree`). Check out the PR branch
 
 Pipeline:
 
-0. **Load project conventions before addressing any finding.** Run the **Convention-loading protocol** (Modules 1 + 2 — see the section by that name near the top of the `workflow:implement` skill) on the PR branch's HEAD:
-
-   - Read `CLAUDE.md` at the repo root.
-   - Identify every markdown link or path-shaped reference in `CLAUDE.md` that points to a doc-shaped file (`.md`, `.rst`, `.txt`) inside this repo. Read each.
-   - From each of those, follow one more level of doc-shaped links — depth-2 from `CLAUDE.md`. Stop there.
-   - Always also read `CONTRIBUTING.md` at the repo root if it exists.
-   - Skip code paths, generated files, lockfiles, and external URLs.
-   - Graceful degradation: if `CLAUDE.md` does not exist and no `CONTRIBUTING.md` is present, proceed without it.
-
-   This load runs **before** addressing any finding so you do not fix one convention violation by reproducing another. Many findings will themselves be convention violations (e.g. "PR body recapitulates the diff", "bullets aren't parallel-shape") and the rule the reviewer cited lives in the docs you just loaded — your fix has to comply with the same rule.
+0. **Load project conventions before addressing any finding.** Run the **Convention-loading protocol** (see § Convention-loading protocol near the top of the `workflow:implement` skill — Module 1 only; the diff/title/body fetch in Module 2 is the reviewer's job, not this fallback's) on the PR branch's HEAD. This load runs first so you do not fix one convention violation by reproducing another. Many findings will themselves be convention violations (e.g. "PR body recapitulates the diff", "bullets aren't parallel-shape") and the rule the reviewer cited lives in the docs you just loaded — your fix has to comply with the same rule.
 
 1. Fetch unaddressed inline comments:
 
