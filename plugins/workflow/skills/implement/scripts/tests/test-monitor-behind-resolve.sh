@@ -111,6 +111,20 @@ case "$1 $2" in
       printf 'gh repo view: rate-limited\n' >&2
       exit 1
     fi
+    # Issue #111 regression: when `view_requires_git_cwd` is set, mirror
+    # real `gh repo view`'s behaviour of deriving the target from the
+    # cwd's git remote -- fail with the canonical "not a git repository"
+    # error if the cwd is not inside a git repo. This catches a regression
+    # where the helper invokes `gh repo view` from inside the empty
+    # tempdir (not a git repo) instead of from the caller's cwd.
+    if [[ "$(cat "${state_dir}/view_requires_git_cwd" 2>/dev/null || echo no)" == "yes" ]]; then
+      # `git rev-parse --git-dir` falls through to the real git binary
+      # via the sibling git-stub's `*)` case.
+      if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        printf 'failed to run git: fatal: not a git repository (or any of the parent directories): .git\n' >&2
+        exit 1
+      fi
+    fi
     printf 'owner/repo\n'
     ;;
   "repo clone")
@@ -331,22 +345,27 @@ assert_not_contains "push failure does NOT emit MONITOR_DEGRADED" \
   "MONITOR_DEGRADED" "$out"
 rm -rf "$sandbox"
 
-# --- Test 8: `gh repo view` failure surfaces as MONITOR_DEGRADED clone.
-# Pins the design decision documented in the PR body: `gh repo view` is
-# folded into the `clone` step because the view call is an argument
-# substitution to clone -- if view fails the clone arg is corrupt and the
-# clone fails, capturing both. `clone_mode=ok` here so the clone-stub-side
-# explicit-fail path is NOT what surfaces the failure -- it has to come
-# from the view-corrupted repo arg flowing into the clone.
+# --- Test 8 (issue #111): a `gh repo view` failure defers silently.
+# The helper resolves `nameWithOwner` from the caller's cwd BEFORE `cd`-ing
+# into the tempdir (which is empty / not a git repo and would deterministically
+# fail the view). A genuine `gh repo view` failure (transient gh, network
+# blip, caller cwd somehow not in a repo) must exit silently to defer to the
+# next tick — same pattern as the CI-not-fully-green precheck — rather than
+# emitting a misleading MONITOR_DEGRADED clone event whose reason text is
+# the `gh repo view` error.
+#
+# This test also pins the deduplication-side contract: a transient view
+# failure must not consume the `clone:<pr>` dedupe slot, so a real later
+# clone failure for the same PR can still surface.
 sandbox=$(make_sandbox)
 dedupe="$sandbox/dedupe"; : >"$dedupe"
 printf 'fail\n' >"$sandbox/state/view_mode"
 out=$(run_helper "$sandbox" 951 feature/v main "$dedupe" 2>&1)
 
-assert_contains "gh repo view failure surfaces as MONITOR_DEGRADED clone" \
-  "MONITOR_DEGRADED 951 clone" "$out"
-assert_contains "view-via-clone failure reason carries the clone-side stderr" \
-  "invalid repository" "$out"
+assert_eq "gh repo view failure defers silently (no event emitted)" \
+  "" "$out"
+assert_eq "gh repo view failure leaves dedupe file untouched" \
+  "" "$(cat "$dedupe")"
 rm -rf "$sandbox"
 
 # --- Test 9 (issue #100): CI-pending precheck defers the resolve.
@@ -416,6 +435,44 @@ out=$(run_helper "$sandbox" 1005 feature/g main "$dedupe" 2>&1)
 
 assert_eq "transient gh failure on precheck defers silently" \
   "" "$out"
+rm -rf "$sandbox"
+
+# --- Test 14 (issue #111): the helper resolves `nameWithOwner` from the
+# caller's cwd (a real git repo), not from the empty tempdir it `cd`s into.
+#
+# Symptom guarded against: `gh repo view` with no `--repo` flag derives
+# the target from the cwd's git remote. If the helper invokes it from
+# inside the freshly-`mktemp -d`'d tmpdir, the call deterministically
+# fails with "not a git repository", the substituted-into-clone-arg
+# becomes the error message, the clone fails, and a `MONITOR_DEGRADED
+# clone` event fires on every BEHIND tick — never resolving.
+#
+# Test design: the gh stub's `repo view` branch checks for a `.git`
+# directory in its cwd when `view_requires_git_cwd` is set, mirroring
+# real `gh repo view`'s cwd-derived behaviour. We run the helper from
+# a git-repo cwd (the sandbox dir, after `git init`). On the buggy code
+# (`gh repo view` runs after `cd "$tmpdir"`, where there's no .git), the
+# stub fails and the test sees `MONITOR_DEGRADED clone`. On the fixed
+# code (`gh repo view` runs before the `cd`), the stub succeeds and the
+# test sees `BEHIND_RESOLVED 1006`.
+sandbox=$(make_sandbox)
+dedupe="$sandbox/dedupe"; : >"$dedupe"
+printf 'yes\n' >"$sandbox/state/view_requires_git_cwd"
+caller_cwd="$sandbox/caller-cwd"
+mkdir -p "$caller_cwd"
+( cd "$caller_cwd" && git init -q )
+out=$(
+  cd "$caller_cwd" && \
+    STATE_DIR="$sandbox/state" PATH="$sandbox/bin:$PATH" \
+    bash "$helper" 1006 feature/c main "$dedupe" 2>&1
+)
+
+assert_contains \
+  "gh repo view runs from caller's cwd (success path proceeds to BEHIND_RESOLVED)" \
+  "BEHIND_RESOLVED 1006" "$out"
+assert_not_contains \
+  "no MONITOR_DEGRADED clone leaks when caller cwd is a real git repo" \
+  "MONITOR_DEGRADED" "$out"
 rm -rf "$sandbox"
 
 if (( failed != 0 )); then

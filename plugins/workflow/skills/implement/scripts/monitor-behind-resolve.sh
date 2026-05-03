@@ -132,15 +132,20 @@ fi
 # back to the caller. The dedupe file lives outside the subshell (passed by
 # path), so writes survive subshell teardown.
 (
+  # Resolve the target repo's `nameWithOwner` BEFORE `cd`-ing into the
+  # tempdir. `gh repo view` with no `--repo` flag derives the target from
+  # the cwd's git remote; the caller's cwd is the orchestrator's session
+  # checkout (a real git repo), but the tempdir below is empty and not a
+  # git repo, so the call must happen here. A failure (transient gh /
+  # network issue, cwd somehow not in a repo) defers silently to the next
+  # tick rather than corrupting the clone arg with the error message.
+  nwo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || exit 0
+
   tmpdir=$(mktemp -d)
   trap 'rm -rf "$tmpdir"' EXIT
   cd "$tmpdir" || exit 0
 
-  # Clone. `gh repo view` is inside the substitution -- if it fails the clone
-  # will too, so capturing the clone failure subsumes both cases.
-  clone_err=$(gh repo clone \
-    "$(gh repo view --json nameWithOwner -q .nameWithOwner 2>&1)" \
-    repo -- --branch "$branch" --depth 50 2>&1 >/dev/null)
+  clone_err=$(gh repo clone "$nwo" repo -- --branch "$branch" --depth 50 2>&1 >/dev/null)
   clone_rc=$?
   if [[ $clone_rc -ne 0 ]]; then
     emit_degraded_once clone "$clone_err"
